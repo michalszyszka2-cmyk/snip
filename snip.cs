@@ -128,7 +128,7 @@ static class Installer
     }
 }
 
-// key=value lines in settings.txt next to the exe: mic, cam, cam_on.
+// key=value lines in settings.txt next to the exe: mic, cam, cam_on, cam_shape.
 static class Settings
 {
     static readonly string File_ = Path.Combine(Installer.Dir, "settings.txt");
@@ -671,7 +671,7 @@ class TrayApp : ApplicationContext
         frame.CamOn = bubble != null;
     }
 
-    // Round camera picture in the bottom-left corner of what is being recorded.
+    // Camera picture (circle, rounded square or 16:9) in the bottom-left corner of what is being recorded.
     void OpenBubble(Rectangle area)
     {
         string cam = CurrentCam();
@@ -688,7 +688,7 @@ class TrayApp : ApplicationContext
         var b = bubble;
         b.Failed += () =>
         {
-            bool camOnly = !b.Round;
+            bool camOnly = !b.Overlay;
             CloseBubble();
             if (frame != null) frame.CamOn = false;
             if (camOnly) { if (Recorder.Active) Recorder.Cancel(); else CloseAll(); }
@@ -768,6 +768,16 @@ class TrayApp : ApplicationContext
             camMenu.DropDownItems.Add(it);
         }
         if (camMenu.DropDownItems.Count == 1) camMenu.DropDownItems.Add("(no camera found)").Enabled = false;
+        // the shape of the camera on screen recordings (right-clicking the camera changes it too)
+        camMenu.DropDownItems.Add(new ToolStripSeparator());
+        string shape = CamBubble.SavedShape();
+        for (int i = 0; i < CamBubble.Shapes.Length; i++)
+        {
+            string sh = CamBubble.Shapes[i];
+            var it = new ToolStripMenuItem(CamBubble.ShapeNames[i]) { Checked = sh == shape };
+            it.Click += (s, e) => { if (bubble != null && bubble.Overlay) bubble.SetShape(sh); else Settings.Set("cam_shape", sh); };
+            camMenu.DropDownItems.Add(it);
+        }
     }
 
     // Saved choice, else the first camera; null = none chosen or none plugged in.
@@ -1232,7 +1242,12 @@ class CamBubble : Form
     [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
     [StructLayout(LayoutKind.Sequential, Pack = 1)] struct BLENDFUNCTION { public byte BlendOp, BlendFlags, SourceConstantAlpha, AlphaFormat; }
 
-    public readonly bool Round;
+    // Overlay = the camera on top of a screen recording; otherwise it is the whole recording (camera only).
+    public readonly bool Overlay;
+    public static readonly string[] Shapes = { "circle", "square", "wide" };
+    public static readonly string[] ShapeNames = { "Circle", "Rounded square", "Rounded rectangle (16:9)" };
+    public static string SavedShape() { string v = Settings.Get("cam_shape"); return Array.IndexOf(Shapes, v) >= 0 ? v : "circle"; }
+    string shape;
     public event Action Failed;           // the camera could not be opened
     readonly string device;
     readonly int[] sizes;
@@ -1242,9 +1257,9 @@ class CamBubble : Form
     volatile bool painting;
     Point grab; bool dragging;
 
-    public CamBubble(string device, bool round)
+    public CamBubble(string device, bool overlay)
     {
-        this.device = device; Round = round;
+        this.device = device; Overlay = overlay; shape = SavedShape();
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
@@ -1252,11 +1267,38 @@ class CamBubble : Form
         float k = Dpi.Scale;
         sizes = new[] { (int)(150 * k), (int)(220 * k), (int)(320 * k) };
         SetPictureSize();
+        if (Overlay)
+        {
+            var menu = new ContextMenuStrip();
+            for (int i = 0; i < Shapes.Length; i++)
+            {
+                string sh = Shapes[i];
+                var it = new ToolStripMenuItem(ShapeNames[i]);
+                it.Click += (s, e) => SetShape(sh);
+                menu.Items.Add(it);
+            }
+            menu.Opening += (s, e) => { for (int i = 0; i < Shapes.Length; i++) ((ToolStripMenuItem)menu.Items[i]).Checked = Shapes[i] == shape; };
+            ContextMenuStrip = menu;
+        }
+    }
+
+    // Change the shape in place, keeping the centre; remembered for next time.
+    public void SetShape(string s)
+    {
+        Settings.Set("cam_shape", s);
+        if (!Overlay || s == shape) return;
+        shape = s;
+        var c = new Point(Left + Width / 2, Top + Height / 2);
+        SetPictureSize();
+        Location = new Point(c.X - fw / 2, c.Y - fh / 2);
+        Present(null);
+        StartFeed();
     }
 
     void SetPictureSize()
     {
-        if (Round) fw = fh = sizes[sizeIx] & ~1;
+        if (Overlay && shape == "wide") { fh = (sizes[sizeIx] * 3 / 4) & ~1; fw = (fh * 16 / 9) & ~1; }
+        else if (Overlay) fw = fh = sizes[sizeIx] & ~1;
         else
         {
             fw = Math.Min(1280, (int)(Screen.PrimaryScreen.WorkingArea.Width * 0.6)) & ~1;
@@ -1286,7 +1328,7 @@ class CamBubble : Form
     {
         string exe = Ffmpeg.Find();
         if (exe == null) { Fail(); return; }
-        string crop = Round ? "crop=w='min(iw,ih)':h='min(iw,ih)'" : "crop=w='min(iw,ih*16/9)':h='min(ih,iw*9/16)'";
+        string crop = Overlay && shape != "wide" ? "crop=w='min(iw,ih)':h='min(iw,ih)'" : "crop=w='min(iw,ih*16/9)':h='min(ih,iw*9/16)'";
         string args = "-hide_banner -loglevel error -f dshow -rtbufsize 100M " +
             (hd ? "-vcodec mjpeg -video_size 1280x720 -framerate 30 " : "") +
             "-i \"video=" + device + "\" -vf \"" + crop + ",scale=" + fw + ":" + fh + ",hflip\" -pix_fmt bgra -f rawvideo pipe:1";
@@ -1333,7 +1375,9 @@ class CamBubble : Form
     GraphicsPath Shape(Rectangle r)
     {
         var p = new GraphicsPath();
-        if (Round) p.AddEllipse(r); else p.AddRectangle(r);
+        if (!Overlay) p.AddRectangle(r);
+        else if (shape == "circle") p.AddEllipse(r);
+        else return RecFrame.Rounded(r, Math.Min(fw, fh) / 8);
         return p;
     }
 
@@ -1356,7 +1400,7 @@ class CamBubble : Form
                 if (pic == null)
                     TextRenderer.DrawText(g, "Camera...", new Font("Segoe UI", 10f), new Rectangle(0, 0, fw, fh), Color.FromArgb(190, 190, 184),
                         TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
-                if (Round)
+                if (Overlay && shape == "circle")
                 {
                     float ring = 3 * Dpi.Scale;
                     using (var pen = new Pen(Color.FromArgb(235, 255, 255, 255), ring))
@@ -1373,11 +1417,11 @@ class CamBubble : Form
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
-        if (Round && e.Button == MouseButtons.Left) { dragging = true; grab = e.Location; Cursor = Cursors.SizeAll; }
+        if (Overlay && e.Button == MouseButtons.Left) { dragging = true; grab = e.Location; Cursor = Cursors.SizeAll; }
     }
     protected override void OnMouseMove(MouseEventArgs e)
     {
-        if (!Round) return;
+        if (!Overlay) return;
         Cursor = Cursors.SizeAll;
         if (dragging) { var c = Control.MousePosition; Location = new Point(c.X - grab.X, c.Y - grab.Y); }
     }
@@ -1386,7 +1430,7 @@ class CamBubble : Form
     // small -> medium -> large, keeping its centre where it is
     protected override void OnMouseDoubleClick(MouseEventArgs e)
     {
-        if (!Round) return;
+        if (!Overlay) return;
         var c = new Point(Left + Width / 2, Top + Height / 2);
         sizeIx = (sizeIx + 1) % sizes.Length;
         SetPictureSize();
