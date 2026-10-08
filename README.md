@@ -7,7 +7,8 @@ A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** toge
 - Snips are shrunk to at most 1568 px on the long side, which keeps big ones small (a full 4K screen comes out around 0.3 MB). That's the size Claude and most chat tools scale images down to anyway.
 - Snips are never saved to disk. **Esc** cancels.
 - Recordings go to your **Downloads** folder as `recording-YYYY-MM-DD-HHMM.mp4` (H.264 + AAC, 30 fps, playable anywhere). The frame stays round the area while recording with a timer; nothing of it is in the video. Stop with the frame's button, Alt+S, a click on the red tray dot, or the tray menu; Explorer then opens Downloads with the new file selected.
-- **Camera, like Loom:** your webcam shows as a round bubble in the corner of the recording. Drag it anywhere, double-click it to change its size, or hide it with the camera button on the bar. *Record the camera only* in the tray menu records just you.
+- **Camera, like Loom:** your webcam shows in the corner of the recording as a circle, a rounded square or a rounded 16:9 picture. Drag it anywhere, double-click it to change its size, right-click it to change its shape or background, or hide it with the camera button on the bar.
+- **Background blur or picture:** blur the room behind you, or swap it for a picture of your choice. An AI model (Robust Video Matting) finds you in the picture and follows you from frame to frame, run by the machine-learning engine built into Windows (on the graphics chip when it can), so nothing is uploaded. The model is downloaded once, with your say-so (about 15 MB, kept in Snip's own folder). *Record the camera only* in the tray menu records just you.
 - **Pause, resume, start over.** Recording starts after a 3, 2, 1 countdown. Pause leaves the pause out of the video; Start over throws the take away and gets you ready again.
 - Recording uses [FFmpeg](https://ffmpeg.org/). If it isn't on the computer, Snip offers to download it the first time you record (about 115 MB, kept in Snip's own folder).
 
@@ -32,7 +33,7 @@ Because the exe isn't code-signed, Windows may show **"Windows protected your PC
 | **Esc** | Cancel |
 | Right-click the tray camera | Snip now / Record an area / Record the whole screen / Record the camera only / Pause / Camera / Microphone / Open the recordings folder / Quit / Uninstall |
 
-The **Camera** menu picks the webcam, or "No camera". The **Microphone** menu lists what Windows sees; the first one is used until you pick another, and "No microphone" records silent video. Computer sound (what the speakers play) is not recorded.
+The **Camera** menu picks the webcam, or "No camera", the camera's shape, and the background: none, blur, or a picture. The **Microphone** menu lists what Windows sees; the first one is used until you pick another, and "No microphone" records silent video. Computer sound (what the speakers play) is not recorded.
 
 The shortcut uses the `'` and `#` keys of a UK keyboard (next to Enter). On other layouts it uses whichever keys type `'` and `#`.
 
@@ -49,6 +50,8 @@ produces `snip.exe` from `snip.cs` and `camera.ico`.
 ## Credits
 
 Camera icon: [Microsoft Fluent UI Emoji](https://github.com/microsoft/fluentui-emoji), MIT licence.
+
+Background model: [Robust Video Matting](https://github.com/PeterL1n/RobustVideoMatting) by Shanchuan Lin et al. (ByteDance), GPL-3.0 licence. It is not part of this program: Snip downloads `rvm_mobilenetv3_fp32.onnx` from the authors' GitHub release the first time you switch a background effect on.
 
 ## Licence
 

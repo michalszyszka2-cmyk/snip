@@ -128,7 +128,7 @@ static class Installer
     }
 }
 
-// key=value lines in settings.txt next to the exe: mic, cam, cam_on, cam_shape.
+// key=value lines in settings.txt next to the exe: mic, cam, cam_on, cam_shape, cam_bg, cam_bg_pic.
 static class Settings
 {
     static readonly string File_ = Path.Combine(Installer.Dir, "settings.txt");
@@ -208,52 +208,19 @@ static class Ffmpeg
         if (MessageBox.Show("Recording needs FFmpeg, a free video encoder, which is not on this computer.\n\n" +
                 "Download it now? About 115 MB, from gyan.dev, kept inside Snip's own folder.",
                 "Snip", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return null;
-        using (var f = new DownloadForm()) f.ShowDialog();
+        string zip = Path.Combine(Path.GetTempPath(), "snip-ffmpeg.zip");
+        using (var f = new DownloadForm("Snip - downloading FFmpeg", DownloadUrl, zip, () => Unpack(zip))) f.ShowDialog();
         return Find();
     }
 
-    class DownloadForm : Form
+    static void Unpack(string zip)
     {
-        readonly ProgressBar bar = new ProgressBar { Dock = DockStyle.Bottom, Height = 22, Maximum = 1000 };
-        readonly Label label = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(10, 0, 0, 0) };
-        readonly WebClient web = new WebClient();
-        readonly string zip = Path.Combine(Path.GetTempPath(), "snip-ffmpeg.zip");
-
-        public DownloadForm()
-        {
-            Text = "Snip - downloading FFmpeg"; Width = 420; Height = 110;
-            FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
-            StartPosition = FormStartPosition.CenterScreen; TopMost = true;
-            Controls.Add(label); Controls.Add(bar);
-            label.Text = "Starting…";
-            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
-            web.DownloadProgressChanged += (s, e) =>
-            {
-                bar.Value = Math.Min(1000, (int)(e.ProgressPercentage * 10));
-                label.Text = string.Format("Downloading… {0} / {1} MB", e.BytesReceived >> 20, e.TotalBytesToReceive >> 20);
-            };
-            web.DownloadFileCompleted += (s, e) =>
-            {
-                if (e.Cancelled) { Close(); return; }
-                if (e.Error != null) { MessageBox.Show(this, "Download failed:\n\n" + e.Error.Message, "Snip"); Close(); return; }
-                label.Text = "Unpacking…"; Refresh();
-                try { Unpack(); }
-                catch (Exception ex) { MessageBox.Show(this, "Could not unpack FFmpeg:\n\n" + ex.Message, "Snip"); }
-                Close();
-            };
-            Shown += (s, e) => web.DownloadFileAsync(new Uri(DownloadUrl), zip);
-            FormClosing += (s, e) => { if (web.IsBusy) web.CancelAsync(); };
-        }
-
-        void Unpack()
-        {
-            Directory.CreateDirectory(Path.GetDirectoryName(OwnCopy));
-            using (var z = ZipFile.OpenRead(zip))
-                foreach (var entry in z.Entries)
-                    if (entry.Name.Equals("ffmpeg.exe", StringComparison.OrdinalIgnoreCase)) { entry.ExtractToFile(OwnCopy, true); break; }
-            try { File.Delete(zip); } catch { }
-            if (!File.Exists(OwnCopy)) throw new Exception("ffmpeg.exe was not in the archive.");
-        }
+        Directory.CreateDirectory(Path.GetDirectoryName(OwnCopy));
+        using (var z = ZipFile.OpenRead(zip))
+            foreach (var entry in z.Entries)
+                if (entry.Name.Equals("ffmpeg.exe", StringComparison.OrdinalIgnoreCase)) { entry.ExtractToFile(OwnCopy, true); break; }
+        try { File.Delete(zip); } catch { }
+        if (!File.Exists(OwnCopy)) throw new Exception("ffmpeg.exe was not in the archive.");
     }
 
     // "ffmpeg -list_devices" prints each DirectShow device with its alternative (stable) name on the next line.
@@ -291,8 +258,47 @@ static class Ffmpeg
 // (DirectShow), encodes H.264 + AAC. ffmpeg cannot pause, so each stretch between Pause and
 // Resume is its own segment file in %TEMP%; Stop joins them losslessly (concat, -c copy)
 // into the mp4 in Downloads. "q" on stdin ends a segment cleanly so it is playable.
+// A small progress window that downloads one file to disk, then runs an optional follow-up step
+// (unpacking, say) before it closes. Closing it part-way cancels the download.
+class DownloadForm : Form
+{
+    readonly ProgressBar bar = new ProgressBar { Dock = DockStyle.Bottom, Height = 22, Maximum = 1000 };
+    readonly Label label = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(10, 0, 0, 0) };
+    readonly WebClient web = new WebClient();
+
+    public DownloadForm(string title, string url, string dest, Action afterwards)
+    {
+        Text = title; Width = 420; Height = 110;
+        FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen; TopMost = true;
+        Controls.Add(label); Controls.Add(bar);
+        label.Text = "Starting…";
+        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+        web.DownloadProgressChanged += (s, e) =>
+        {
+            bar.Value = Math.Min(1000, (int)(e.ProgressPercentage * 10));
+            label.Text = string.Format("Downloading… {0} / {1} MB", e.BytesReceived >> 20, e.TotalBytesToReceive >> 20);
+        };
+        web.DownloadFileCompleted += (s, e) =>
+        {
+            if (e.Cancelled) { Close(); return; }
+            if (e.Error != null) { MessageBox.Show(this, "Download failed:\n\n" + e.Error.Message, "Snip"); Close(); return; }
+            if (afterwards != null)
+            {
+                label.Text = "Unpacking…"; Refresh();
+                try { afterwards(); }
+                catch (Exception ex) { MessageBox.Show(this, "Could not unpack the download:\n\n" + ex.Message, "Snip"); }
+            }
+            Close();
+        };
+        Shown += (s, e) => { Directory.CreateDirectory(Path.GetDirectoryName(dest)); web.DownloadFileAsync(new Uri(url), dest); };
+        FormClosing += (s, e) => { if (web.IsBusy) web.CancelAsync(); };
+    }
+}
+
 static class Recorder
 {
+    [DllImport("kernel32.dll")] static extern ulong GetTickCount64();
     [DllImport("shell32.dll")] static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid id, uint flags, IntPtr token, out IntPtr path);
 
     enum After { None, Pause, Finish, Cancel }
@@ -358,8 +364,15 @@ static class Recorder
         a.AppendFormat("-thread_queue_size 1024 -f gdigrab -framerate 30 -offset_x {0} -offset_y {1} -video_size {2}x{3} -draw_mouse 1 -i desktop ",
             area.X, area.Y, area.Width, area.Height);
         if (mic != null)
-            a.AppendFormat("-thread_queue_size 1024 -rtbufsize 100M -f dshow -i \"audio={0}\" ", mic.Alt ?? mic.Name);
-        a.Append("-c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -r 30 ");
+        {
+            // gdigrab stamps frames with the epoch clock; dshow stamps audio with the system tick clock
+            // (ms since boot), and ffmpeg would otherwise reset each input to zero and lose the ~1 s the
+            // mic takes to start. Shift the audio onto the epoch clock so -copyts keeps the real offset.
+            double tickToEpoch = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds - GetTickCount64() / 1000.0;
+            a.AppendFormat(System.Globalization.CultureInfo.InvariantCulture,
+                "-itsoffset {0:F3} -thread_queue_size 1024 -rtbufsize 100M -f dshow -i \"audio={1}\" ", tickToEpoch, mic.Alt ?? mic.Name);
+        }
+        a.Append("-copyts -avoid_negative_ts make_zero -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -r 30 ");
         if (mic != null) a.Append("-c:a aac -b:a 160k -ac 1 ");
         a.Append('"').Append(segFile).Append('"');
 
@@ -382,6 +395,7 @@ static class Recorder
         p.EnableRaisingEvents = true;
         p.ErrorDataReceived += (s, e) => { if (e.Data != null) lock (errors) errors.AppendLine(e.Data); };
         p.BeginErrorReadLine();
+        try { p.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }   // the mic must never wait for the camera effect
         p.Exited += (s, e) => ui.BeginInvoke(new Action(() => OnSegExit(p, errors)));
         return true;
     }
@@ -778,6 +792,8 @@ class TrayApp : ApplicationContext
             it.Click += (s, e) => { if (bubble != null && bubble.Overlay) bubble.SetShape(sh); else Settings.Set("cam_shape", sh); };
             camMenu.DropDownItems.Add(it);
         }
+        camMenu.DropDownItems.Add(new ToolStripSeparator());
+        CamBg.AddMenuItems(camMenu.DropDownItems);
     }
 
     // Saved choice, else the first camera; null = none chosen or none plugged in.
@@ -1267,19 +1283,27 @@ class CamBubble : Form
         float k = Dpi.Scale;
         sizes = new[] { (int)(150 * k), (int)(220 * k), (int)(320 * k) };
         SetPictureSize();
-        if (Overlay)
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("-");
+        menu.Opening += (s, e) =>
         {
-            var menu = new ContextMenuStrip();
-            for (int i = 0; i < Shapes.Length; i++)
+            menu.Items.Clear();
+            if (Overlay)
             {
-                string sh = Shapes[i];
-                var it = new ToolStripMenuItem(ShapeNames[i]);
-                it.Click += (s, e) => SetShape(sh);
-                menu.Items.Add(it);
+                for (int i = 0; i < Shapes.Length; i++)
+                {
+                    string sh = Shapes[i];
+                    var it = new ToolStripMenuItem(ShapeNames[i]) { Checked = sh == shape };
+                    it.Click += (s2, e2) => SetShape(sh);
+                    menu.Items.Add(it);
+                }
+                menu.Items.Add(new ToolStripSeparator());
             }
-            menu.Opening += (s, e) => { for (int i = 0; i < Shapes.Length; i++) ((ToolStripMenuItem)menu.Items[i]).Checked = Shapes[i] == shape; };
-            ContextMenuStrip = menu;
-        }
+            CamBg.AddMenuItems(menu.Items);
+            e.Cancel = false;
+        };
+        ContextMenuStrip = menu;
+        if (CamBg.Mode != "none") Segmenter.Warm();
     }
 
     // Change the shape in place, keeping the centre; remembered for next time.
@@ -1355,14 +1379,23 @@ class CamBubble : Form
                 while (got < len) { int n = stream.Read(buf, got, len - got); if (n <= 0) break; got += n; }
                 if (got < len) break;
                 frames++;
-                if (painting) continue;               // the window is still busy with the last one
-                var bmp = new Bitmap(w, h, PixelFormat.Format32bppArgb);
-                var d = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-                Marshal.Copy(buf, 0, d.Scan0, len);
-                bmp.UnlockBits(d);
+                if (painting) continue;               // still busy with the last one: drop this frame
                 painting = true;
-                try { BeginInvoke(new Action(() => { try { if (p == proc && w == fw && h == fh) Present(bmp); } finally { bmp.Dispose(); painting = false; } })); }
-                catch { bmp.Dispose(); return; }
+                var frame = (byte[])buf.Clone();
+                // background effect off this thread, so the pipe from ffmpeg keeps draining
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    Bitmap bmp = null;
+                    Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;   // the recording comes first
+                    try
+                    {
+                        try { CamBg.Apply(frame, w, h); } catch { }
+                        bmp = Img.FromBytes(frame, w, h);
+                        var b = bmp;
+                        BeginInvoke(new Action(() => { try { if (p == proc && w == fw && h == fh) Present(b); } finally { b.Dispose(); painting = false; } }));
+                    }
+                    catch { if (bmp != null) bmp.Dispose(); painting = false; }
+                });
             }
         }
         catch { }
@@ -1443,6 +1476,446 @@ class CamBubble : Form
     {
         if (disposing) StopFeed();
         base.Dispose(disposing);
+    }
+}
+
+// Background blur / picture behind the person on camera. A portrait-matting model (MODNet, Apache-2.0,
+// packed into the exe) finds the person; Windows' own ML runtime (WinML) runs it, on the GPU when it can.
+static class CamBg
+{
+    public static readonly string[] Modes = { "none", "blur", "picture" };
+    public static volatile string Mode = Load();
+    static Bitmap picture;                 // the chosen background picture, as loaded
+    static readonly object picLock = new object();
+    static Bitmap picScaled;               // ...and scaled to cover the last frame size
+
+    static string Load()
+    {
+        string m = Settings.Get("cam_bg");
+        if (m == "picture" && !LoadPicture(Settings.Get("cam_bg_pic"))) m = "none";
+        return Array.IndexOf(Modes, m) >= 0 ? m : "none";
+    }
+
+    static bool LoadPicture(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return false;
+        try
+        {
+            Bitmap b;
+            using (var s = new MemoryStream(File.ReadAllBytes(path)))
+            using (var img = Image.FromStream(s)) b = new Bitmap(img);
+            lock (picLock) { picture = b; picScaled = null; }
+            return true;
+        }
+        catch { return false; }
+    }
+
+    // The three menu entries, for the tray's Camera menu and the camera's right-click menu.
+    public static void AddMenuItems(ToolStripItemCollection items)
+    {
+        string pic = Settings.Get("cam_bg_pic");
+        string picName = Mode == "picture" && !string.IsNullOrEmpty(pic) ? "Picture background (" + Path.GetFileName(pic) + ")..." : "Picture background...";
+        var none = new ToolStripMenuItem("No background effect") { Checked = Mode == "none" };
+        none.Click += (s, e) => Set("none");
+        var blur = new ToolStripMenuItem("Blur the background") { Checked = Mode == "blur" };
+        blur.Click += (s, e) => Set("blur");
+        var picture_ = new ToolStripMenuItem(picName) { Checked = Mode == "picture" };
+        picture_.Click += (s, e) => ChoosePicture();
+        if (Segmenter.Broken) { blur.Enabled = picture_.Enabled = false; blur.Text += "  (not available on this PC)"; }
+        else if (!Segmenter.HaveModel) blur.Text += "  (downloads a 15 MB model first)";
+        items.Add(none); items.Add(blur); items.Add(picture_);
+    }
+
+    static void Set(string m)
+    {
+        if (m != "none" && !Segmenter.Ensure()) return;
+        Mode = m; Settings.Set("cam_bg", m);
+        if (m != "none") Segmenter.Warm();
+    }
+
+    static void ChoosePicture()
+    {
+        using (var d = new OpenFileDialog { Title = "Choose a background picture", Filter = "Pictures|*.jpg;*.jpeg;*.png;*.bmp;*.gif|All files|*.*" })
+        {
+            string old = Settings.Get("cam_bg_pic");
+            if (!string.IsNullOrEmpty(old) && File.Exists(old)) d.InitialDirectory = Path.GetDirectoryName(old);
+            else d.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+            if (d.ShowDialog() != DialogResult.OK) return;
+            if (!LoadPicture(d.FileName)) { MessageBox.Show("Could not open that picture.", "Snip", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+            Settings.Set("cam_bg_pic", d.FileName);
+            Set("picture");
+        }
+    }
+
+    // px: one BGRA frame, changed in place. Does nothing until the model has produced a first mask.
+    public static void Apply(byte[] px, int w, int h)
+    {
+        string mode = Mode;
+        if (mode == "none") return;
+        Segmenter.Offer(px, w, h);
+        var m = Segmenter.Latest;
+        if (m == null) return;
+        byte[] al = Feather(m, w, h);
+        byte[] bg; int bw = w, bh = h;
+        if (mode == "blur") bg = BlurSmall(px, w, h, out bw, out bh);
+        else bg = Picture(w, h);
+        if (bg == null) return;
+        Blend(px, w, h, al, bg, bw, bh);
+    }
+
+    // Bilinear lookup tables for one axis: destination index -> two source indices and a 0..256 weight.
+    class Axis
+    {
+        public readonly int[] I0, I1, F;
+        public Axis(int dst, int src)
+        {
+            I0 = new int[dst]; I1 = new int[dst]; F = new int[dst];
+            float k = (float)src / dst;
+            for (int i = 0; i < dst; i++)
+            {
+                float s = (i + 0.5f) * k - 0.5f;
+                if (s < 0) s = 0;
+                int a = (int)s; if (a > src - 1) a = src - 1;
+                I0[i] = a; I1[i] = Math.Min(a + 1, src - 1); F[i] = (int)((s - a) * 256);
+            }
+        }
+    }
+    static readonly Dictionary<long, Axis> axes = new Dictionary<long, Axis>();
+    static Axis Ax(int dst, int src)
+    {
+        long key = ((long)dst << 32) | (uint)src;
+        lock (axes) { Axis a; if (!axes.TryGetValue(key, out a)) axes[key] = a = new Axis(dst, src); return a; }
+    }
+
+    // The model's small mask grown to frame size with a soft edge: pulled in a touch (the model
+    // tends to grab a sliver of background), scaled up, then blurred a few pixels so the cut
+    // never reads as a hard outline.
+    static byte[] Feather(Segmenter.MaskData m, int w, int h)
+    {
+        int mw = m.W, mh = m.H; float[] a = m.A;
+        var e = new byte[mw * mh];
+        for (int y = 0; y < mh; y++)
+            for (int x = 0; x < mw; x++)
+            {
+                float v = 1;
+                for (int dy = -1; dy <= 1; dy++)
+                {
+                    int yy = y + dy; if (yy < 0 || yy >= mh) continue;
+                    for (int dx = -1; dx <= 1; dx++)
+                    {
+                        int xx = x + dx; if (xx < 0 || xx >= mw) continue;
+                        float t = a[yy * mw + xx]; if (t < v) v = t;
+                    }
+                }
+                e[y * mw + x] = (byte)(v <= 0 ? 0 : v >= 1 ? 255 : v * 255);
+            }
+        var ax = Ax(w, mw); var ay = Ax(h, mh);
+        var full = new byte[w * h];
+        for (int y = 0; y < h; y++)
+        {
+            int ra = ay.I0[y] * mw, rb = ay.I1[y] * mw, fy = ay.F[y], row = y * w;
+            for (int x = 0; x < w; x++)
+            {
+                int x0 = ax.I0[x], x1 = ax.I1[x], fx = ax.F[x];
+                int top = e[ra + x0] * (256 - fx) + e[ra + x1] * fx;
+                int bot = e[rb + x0] * (256 - fx) + e[rb + x1] * fx;
+                full[row + x] = (byte)((top * (256 - fy) + bot * fy) >> 16);
+            }
+        }
+        int r = Math.Max(1, Math.Min(w, h) / 320);
+        full = BoxGray(full, w, h, r); full = BoxGray(full, w, h, r);
+        return full;
+    }
+
+    // One separable box blur over a one-channel image (edges clamped).
+    static byte[] BoxGray(byte[] src, int w, int h, int r)
+    {
+        var t = new byte[src.Length]; var o = new byte[src.Length];
+        int n = 2 * r + 1;
+        for (int y = 0; y < h; y++)
+        {
+            int row = y * w, sum = 0;
+            for (int i = -r; i <= r; i++) sum += src[row + Math.Min(Math.Max(i, 0), w - 1)];
+            for (int x = 0; x < w; x++)
+            {
+                t[row + x] = (byte)(sum / n);
+                sum += src[row + Math.Min(x + r + 1, w - 1)] - src[row + Math.Max(x - r, 0)];
+            }
+        }
+        for (int x = 0; x < w; x++)
+        {
+            int sum = 0;
+            for (int i = -r; i <= r; i++) sum += t[Math.Min(Math.Max(i, 0), h - 1) * w + x];
+            for (int y = 0; y < h; y++)
+            {
+                o[y * w + x] = (byte)(sum / n);
+                sum += t[Math.Min(y + r + 1, h - 1) * w + x] - t[Math.Max(y - r, 0) * w + x];
+            }
+        }
+        return o;
+    }
+
+    // The soft mask decides, per pixel, how much of the background copy shows through.
+    static void Blend(byte[] px, int w, int h, byte[] al, byte[] bg, int bw, int bh)
+    {
+        bool small = bw != w || bh != h;
+        var bx = Ax(w, bw); var by = Ax(h, bh);
+        System.Threading.Tasks.Parallel.For(0, h, new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = 2 }, y =>
+        {
+            int ba = by.I0[y] * bw * 4, bb = by.I1[y] * bw * 4, gy = by.F[y];
+            int row = y * w * 4, arow = y * w;
+            for (int x = 0; x < w; x++)
+            {
+                int a = al[arow + x];
+                if (a >= 254) continue;
+                int j = row + x * 4, ia = 255 - a;
+                if (small)
+                {
+                    int p0 = bx.I0[x] * 4, p1 = bx.I1[x] * 4, gx = bx.F[x];
+                    for (int c = 0; c < 3; c++)
+                    {
+                        int t = bg[ba + p0 + c] * (256 - gx) + bg[ba + p1 + c] * gx;
+                        int u = bg[bb + p0 + c] * (256 - gx) + bg[bb + p1 + c] * gx;
+                        int b = (t * (256 - gy) + u * gy) >> 16;
+                        px[j + c] = (byte)((px[j + c] * a + b * ia + 127) / 255);
+                    }
+                }
+                else
+                    for (int c = 0; c < 3; c++) px[j + c] = (byte)((px[j + c] * a + bg[j + c] * ia + 127) / 255);
+            }
+        });
+    }
+
+    // The frame shrunk by area-averaging and box-blurred three times (close to a Gaussian);
+    // Blend grows it back bilinearly, which at this size reads as a smooth lens blur.
+    const int BlurShrink = 6;
+    static byte[] BlurSmall(byte[] px, int w, int h, out int tw, out int th)
+    {
+        int k = BlurShrink;
+        tw = Math.Max(2, w / k); th = Math.Max(2, h / k);
+        var t = new byte[tw * th * 4];
+        int area = k * k;
+        for (int y = 0; y < th; y++)
+            for (int x = 0; x < tw; x++)
+            {
+                int b = 0, g = 0, r = 0;
+                for (int yy = y * k; yy < y * k + k; yy++)
+                {
+                    int i = (yy * w + x * k) * 4;
+                    for (int xx = 0; xx < k; xx++, i += 4) { b += px[i]; g += px[i + 1]; r += px[i + 2]; }
+                }
+                int o = (y * tw + x) * 4;
+                t[o] = (byte)(b / area); t[o + 1] = (byte)(g / area); t[o + 2] = (byte)(r / area); t[o + 3] = 255;
+            }
+        int rad = Math.Max(2, tw / 40);
+        for (int pass = 0; pass < 3; pass++) t = BoxColor(t, tw, th, rad);
+        return t;
+    }
+
+    // Separable box blur over a BGRA image (edges clamped).
+    static byte[] BoxColor(byte[] src, int w, int h, int r)
+    {
+        var t = new byte[src.Length]; var o = new byte[src.Length];
+        int n = 2 * r + 1;
+        for (int y = 0; y < h; y++)
+            for (int c = 0; c < 3; c++)
+            {
+                int row = y * w * 4 + c, sum = 0;
+                for (int i = -r; i <= r; i++) sum += src[row + Math.Min(Math.Max(i, 0), w - 1) * 4];
+                for (int x = 0; x < w; x++)
+                {
+                    t[row + x * 4] = (byte)(sum / n);
+                    sum += src[row + Math.Min(x + r + 1, w - 1) * 4] - src[row + Math.Max(x - r, 0) * 4];
+                }
+            }
+        for (int x = 0; x < w; x++)
+            for (int c = 0; c < 3; c++)
+            {
+                int col = x * 4 + c, sum = 0;
+                for (int i = -r; i <= r; i++) sum += t[Math.Min(Math.Max(i, 0), h - 1) * w * 4 + col];
+                for (int y = 0; y < h; y++)
+                {
+                    o[y * w * 4 + col] = (byte)(sum / n);
+                    sum += t[Math.Min(y + r + 1, h - 1) * w * 4 + col] - t[Math.Max(y - r, 0) * w * 4 + col];
+                }
+            }
+        for (int i = 3; i < o.Length; i += 4) o[i] = 255;
+        return o;
+    }
+
+    // The picture scaled to cover the frame (cropped, never stretched).
+    static byte[] Picture(int w, int h)
+    {
+        lock (picLock)
+        {
+            if (picture == null) return null;
+            if (picScaled == null || picScaled.Width != w || picScaled.Height != h)
+            {
+                if (picScaled != null) picScaled.Dispose();
+                float k = Math.Max((float)w / picture.Width, (float)h / picture.Height);
+                int sw = (int)Math.Ceiling(picture.Width * k), sh = (int)Math.Ceiling(picture.Height * k);
+                picScaled = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+                using (var g = Graphics.FromImage(picScaled))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.DrawImage(picture, (w - sw) / 2, (h - sh) / 2, sw, sh);
+                }
+            }
+            return Img.Bytes(picScaled);
+        }
+    }
+}
+
+// Runs Robust Video Matting on each frame and hands back a frame-size 0..1 mask (1 = person).
+// The model remembers the last frames (its "recurrent state"), which is what keeps the outline
+// steady from one frame to the next. It is GPL-3.0, so it is not packed into snip.exe: Snip asks
+// once and downloads it from the authors' GitHub release into its own folder.
+static class Segmenter
+{
+    const string ModelUrl = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx";
+    const long ModelSize = 14975696;
+    static readonly string ModelPath = Path.Combine(Installer.Dir, "rvm_mobilenetv3_fp32.onnx");
+    static Windows.AI.MachineLearning.LearningModelSession session;
+    static volatile bool loading;
+    public static volatile bool Broken;
+
+    public static bool HaveModel { get { try { return new FileInfo(ModelPath).Length == ModelSize; } catch { return false; } } }
+
+    // Ask once and download the model. True when it is on disk.
+    public static bool Ensure()
+    {
+        if (HaveModel) return true;
+        if (MessageBox.Show("The background effect needs an AI model that finds you in the picture: Robust Video Matting, " +
+                "free under the GPL-3.0 licence, which is not on this computer.\n\n" +
+                "Download it now? About 15 MB, from github.com, kept inside Snip's own folder.",
+                "Snip", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return false;
+        using (var f = new DownloadForm("Snip - downloading the background model", ModelUrl, ModelPath, null)) f.ShowDialog();
+        if (HaveModel) return true;
+        try { File.Delete(ModelPath); } catch { }
+        return false;
+    }
+
+    // Load the model in the background; the first run on the GPU takes a few seconds, so do it now.
+    public static void Warm()
+    {
+        if (session != null || loading || Broken || !HaveModel) return;
+        loading = true;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try
+            {
+                var model = Windows.AI.MachineLearning.LearningModel.LoadFromFilePath(ModelPath);
+                Windows.AI.MachineLearning.LearningModelSession s;
+                try { s = new Windows.AI.MachineLearning.LearningModelSession(model, new Windows.AI.MachineLearning.LearningModelDevice(Windows.AI.MachineLearning.LearningModelDeviceKind.DirectXHighPerformance)); Reset(); Run(s, new float[3 * 64 * 64], 64, 64, 1); }
+                catch { s = new Windows.AI.MachineLearning.LearningModelSession(model, new Windows.AI.MachineLearning.LearningModelDevice(Windows.AI.MachineLearning.LearningModelDeviceKind.Cpu)); }
+                Reset();
+                session = s;
+            }
+            catch { Broken = true; }
+            finally { loading = false; }
+        });
+    }
+
+    // The four recurrent tensors, fed back in on the next frame; zeros to start from scratch.
+    static Windows.AI.MachineLearning.TensorFloat r1, r2, r3, r4;
+    static void Reset()
+    {
+        r1 = Zero(); r2 = Zero(); r3 = Zero(); r4 = Zero();
+    }
+    static Windows.AI.MachineLearning.TensorFloat Zero() { return Windows.AI.MachineLearning.TensorFloat.CreateFromArray(new long[] { 1, 1, 1, 1 }, new float[1]); }
+
+    static float[] Run(Windows.AI.MachineLearning.LearningModelSession s, float[] src, int w, int h, float ratio)
+    {
+        var b = new Windows.AI.MachineLearning.LearningModelBinding(s);
+        b.Bind("src", Windows.AI.MachineLearning.TensorFloat.CreateFromArray(new long[] { 1, 3, h, w }, src));
+        b.Bind("r1i", r1); b.Bind("r2i", r2); b.Bind("r3i", r3); b.Bind("r4i", r4);
+        b.Bind("downsample_ratio", Windows.AI.MachineLearning.TensorFloat.CreateFromArray(new long[] { 1 }, new[] { ratio }));
+        var r = s.Evaluate(b, "");
+        r1 = (Windows.AI.MachineLearning.TensorFloat)r.Outputs["r1o"]; r2 = (Windows.AI.MachineLearning.TensorFloat)r.Outputs["r2o"];
+        r3 = (Windows.AI.MachineLearning.TensorFloat)r.Outputs["r3o"]; r4 = (Windows.AI.MachineLearning.TensorFloat)r.Outputs["r4o"];
+        return System.Linq.Enumerable.ToArray(((Windows.AI.MachineLearning.TensorFloat)r.Outputs["pha"]).GetAsVectorView());
+    }
+
+    public class MaskData { public float[] A; public int W, H; }
+    public static volatile MaskData Latest;     // newest person mask (0..1), frame-sized
+    static volatile bool busy;
+    static float[] input; static int lastW, lastH;
+
+    // Hand over a frame; it is only copied and worked on when the last one is finished.
+    static long lastRun;
+    public static void Offer(byte[] px, int w, int h)
+    {
+        var s = session;
+        if (s == null) { Warm(); return; }
+        if (busy) return;
+        // about 15 runs a second is plenty: the model carries the outline between runs, and the
+        // recording's own ffmpeg needs the CPU more than we do
+        long now = Environment.TickCount;
+        if (now - lastRun < 60) return;
+        lastRun = now;
+        busy = true;
+        var copy = (byte[])px.Clone();
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;
+            try { var m = Mask(s, copy, w, h); if (m != null) Latest = m; } catch { } finally { busy = false; }
+        });
+    }
+
+    static MaskData Mask(Windows.AI.MachineLearning.LearningModelSession s, byte[] px, int w, int h)
+    {
+        int plane = w * h;
+        if (w != lastW || h != lastH) { input = new float[3 * plane]; Reset(); lastW = w; lastH = h; Latest = null; }
+        for (int i = 0, j = 0; i < plane; i++, j += 4)
+        {
+            input[i] = px[j + 2] / 255f;              // R
+            input[plane + i] = px[j + 1] / 255f;      // G
+            input[2 * plane + i] = px[j] / 255f;      // B
+        }
+        // the model looks at a shrunk copy (about 320 px across is plenty for a webcam) and
+        // refines the edge back at full size
+        float ratio = Math.Min(1f, Math.Max(0.25f, 320f / Math.Max(w, h)));
+        return new MaskData { A = Run(s, input, w, h, ratio), W = w, H = h };
+    }
+}
+
+// BGRA byte arrays <-> bitmaps, and smooth resizing without dark edges.
+static class Img
+{
+    public static Bitmap FromBytes(byte[] px, int w, int h)
+    {
+        var b = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        var d = b.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        if (d.Stride == w * 4) Marshal.Copy(px, 0, d.Scan0, w * h * 4);
+        else for (int y = 0; y < h; y++) Marshal.Copy(px, y * w * 4, d.Scan0 + y * d.Stride, w * 4);
+        b.UnlockBits(d);
+        return b;
+    }
+
+    public static byte[] Bytes(Bitmap b)
+    {
+        int w = b.Width, h = b.Height;
+        var px = new byte[w * h * 4];
+        var d = b.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        if (d.Stride == w * 4) Marshal.Copy(d.Scan0, px, 0, px.Length);
+        else for (int y = 0; y < h; y++) Marshal.Copy(d.Scan0 + y * d.Stride, px, y * w * 4, w * 4);
+        b.UnlockBits(d);
+        return px;
+    }
+
+    public static Bitmap Scale(Bitmap src, int w, int h)
+    {
+        var dst = new Bitmap(w, h, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(dst))
+        using (var ia = new ImageAttributes())
+        {
+            ia.SetWrapMode(WrapMode.TileFlipXY);
+            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImage(src, new Rectangle(0, 0, w, h), 0, 0, src.Width, src.Height, GraphicsUnit.Pixel, ia);
+        }
+        return dst;
     }
 }
 
