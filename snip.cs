@@ -448,23 +448,41 @@ class TrayApp : ApplicationContext
         }
         finally { busy = false; }
         // the overlay has closed, so its frozen screenshot is not in the video
-        if (toRecord.HasValue) StartRecording(toRecord.Value);
+        if (toRecord.HasValue) ArmRecording(toRecord.Value);
     }
 
-    void StartRecording(Rectangle area)
+    // Show the frame with its Record / Stop buttons; recording starts on Record.
+    void ArmRecording(Rectangle area)
     {
-        if (Recorder.Active) return;
-        if (!Recorder.Start(area, CurrentMic())) return;
-        frame = new RecFrame(area);
+        if (Recorder.Active || frame != null) return;
+        RecFrame f = null;
+        f = new RecFrame(area,
+            () => { if (StartRecording(area)) f.Started(); },
+            () => Recorder.Stop(),
+            () => { if (Recorder.Active) Recorder.Stop(); else CloseFrame(); });
+        frame = f;
         frame.Show();
+    }
+
+    void CloseFrame()
+    {
+        if (frame == null) return;
+        frame.Close(); frame.Dispose(); frame = null;
+    }
+
+    bool StartRecording(Rectangle area)
+    {
+        if (Recorder.Active) return false;
+        if (!Recorder.Start(area, CurrentMic())) return false;
         tray.Icon = recIcon;
         tray.Text = "Snip  -  recording, Alt+S to stop";
-        tray.ShowBalloonTip(3000, "Recording", "Stop with Alt+S, or click the red tray icon.", ToolTipIcon.None);
+        tray.ShowBalloonTip(3000, "Recording", "Stop with the Stop button, Alt+S, or a click on the red tray icon.", ToolTipIcon.None);
+        return true;
     }
 
     void OnFinished(string file, string error)
     {
-        if (frame != null) { frame.Close(); frame.Dispose(); frame = null; }
+        CloseFrame();
         tray.Icon = cameraIcon;
         tray.Text = "Snip  -  Ctrl + ' + #";
         if (file != null)
@@ -630,63 +648,101 @@ class KeyHook : IDisposable
     public void Dispose() { UnhookWindowsHookEx(handle); }
 }
 
-// Red border round the area being recorded, with a blinking REC badge and timer. It sits
-// just OUTSIDE the box and is click-through, so it never shows up in the video itself.
+// Red frame round the chosen area with a strip of buttons above it: Record starts the
+// recording, Stop finishes it, X cancels. The frame's window region is only the border and
+// the strip, so the inside is a real hole (clicks go to whatever is underneath) and the
+// border sits just outside the recorded box, so nothing of it is in the video.
 class RecFrame : Form
 {
-    const int Border = 4, Pad = 44;
+    const int Border = 4, Strip = 48;
     readonly Rectangle area;      // screen coordinates of what ffmpeg records
-    readonly DateTime started = DateTime.Now;
+    readonly Action onRecord, onStop, onCancel;
     readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer { Interval = 500 };
     readonly Font font = new Font("Segoe UI", 10f, FontStyle.Bold);
-    bool blink;
+    readonly Button recBtn, stopBtn, closeBtn;
+    readonly Label timeLbl;
+    DateTime started;
+    bool recording, blink;
 
-    public RecFrame(Rectangle area)
+    public RecFrame(Rectangle area, Action onRecord, Action onStop, Action onCancel)
     {
-        this.area = area;
+        this.area = area; this.onRecord = onRecord; this.onStop = onStop; this.onCancel = onCancel;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         TopMost = true;
-        BackColor = Color.FromArgb(1, 2, 3);
-        TransparencyKey = BackColor;   // everything painted in this colour is a hole
-        Bounds = new Rectangle(area.X - Border, area.Y - Pad, area.Width + 2 * Border, area.Height + Border + Pad);
+        BackColor = Color.FromArgb(29, 29, 27);
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
-        tick.Tick += (s, e) => { blink = !blink; Invalidate(Badge); };
+
+        timeLbl = new Label { AutoSize = false, Text = "Ready", ForeColor = Color.White, Font = font, TextAlign = ContentAlignment.MiddleLeft };
+        recBtn = MakeButton("Record", Color.FromArgb(240, 68, 56));
+        stopBtn = MakeButton("Stop & save", Color.FromArgb(58, 58, 55));
+        closeBtn = MakeButton("✕", Color.FromArgb(58, 58, 55));
+        stopBtn.Enabled = false;
+        recBtn.Click += (s, e) => onRecord();
+        stopBtn.Click += (s, e) => { stopBtn.Enabled = false; onStop(); };
+        closeBtn.Click += (s, e) => onCancel();
+        Controls.AddRange(new Control[] { timeLbl, recBtn, stopBtn, closeBtn });
+
+        // strip: [dot + time] [Record] [Stop & save] [x], at least as wide as its contents
+        int x = 34, h = Strip - 12, y = 6;
+        timeLbl.SetBounds(x, y, TextRenderer.MeasureText("00:00", font).Width + 8, h); x = timeLbl.Right + 8;
+        foreach (var b in new[] { recBtn, stopBtn })
+        {
+            b.SetBounds(x, y, TextRenderer.MeasureText(b.Text, b.Font).Width + 28, h); x = b.Right + 6;
+        }
+        closeBtn.SetBounds(x, y, h, h); x = closeBtn.Right + 10;
+        int stripW = Math.Max(x, area.Width + 2 * Border);
+        Bounds = new Rectangle(area.X - Border, area.Y - Strip, stripW, area.Height + Border + Strip);
+
+        // window region = strip + border ring; the inside is not part of the window at all
+        var path = new GraphicsPath(FillMode.Alternate);
+        path.AddRectangle(new Rectangle(0, 0, stripW, Strip));
+        path.AddRectangle(new Rectangle(0, Strip - Border, area.Width + 2 * Border, area.Height + 2 * Border));
+        path.AddRectangle(new Rectangle(Border, Strip, area.Width, area.Height));
+        Region = new Region(path);
+
+        tick.Tick += (s, e) =>
+        {
+            blink = !blink;
+            if (recording) { TimeSpan t = DateTime.Now - started; timeLbl.Text = string.Format("{0}:{1:00}", (int)t.TotalMinutes, t.Seconds); }
+            Invalidate(new Rectangle(0, 0, 34, Strip));
+        };
         tick.Start();
+    }
+
+    static Button MakeButton(string text, Color back)
+    {
+        var b = new Button { Text = text, UseMnemonic = false, FlatStyle = FlatStyle.Flat, BackColor = back, ForeColor = Color.White, Font = new Font("Segoe UI", 10f, FontStyle.Bold), Cursor = Cursors.Hand, TabStop = false };
+        b.FlatAppearance.BorderSize = 0;
+        return b;
+    }
+
+    public void Started()
+    {
+        recording = true; started = DateTime.Now;
+        recBtn.Visible = false;
+        stopBtn.Enabled = true; stopBtn.BackColor = Color.FromArgb(240, 68, 56);
+        timeLbl.Text = "0:00";
     }
 
     protected override CreateParams CreateParams
     {
-        get
-        {
-            var cp = base.CreateParams;
-            cp.ExStyle |= 0x20 | 0x80 | 0x08000000;   // WS_EX_TRANSPARENT (click-through), TOOLWINDOW, NOACTIVATE
-            return cp;
-        }
+        get { var cp = base.CreateParams; cp.ExStyle |= 0x80 | 0x08000000; return cp; }   // TOOLWINDOW, NOACTIVATE
     }
-
     protected override bool ShowWithoutActivation { get { return true; } }
-
-    Rectangle Box { get { return new Rectangle(Border, Pad, area.Width, area.Height); } }
-    Rectangle Badge { get { return new Rectangle(Border, Pad - 36, TextRenderer.MeasureText("REC  00:00   Alt+S", font).Width + 44, 30); } }
 
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        Rectangle box = Box;
         using (var p = new Pen(Color.FromArgb(240, 68, 56), Border))
         {
             p.Alignment = PenAlignment.Inset;
-            g.DrawRectangle(p, new Rectangle(0, Pad - Border, box.Width + 2 * Border, box.Height + 2 * Border));
+            g.DrawRectangle(p, new Rectangle(0, Strip - Border, area.Width + 2 * Border, area.Height + 2 * Border));
         }
-        Rectangle b = Badge;
-        using (var bg = new SolidBrush(Color.FromArgb(29, 29, 27))) g.FillRectangle(bg, b);
-        using (var dot = new SolidBrush(blink ? Color.FromArgb(240, 68, 56) : Color.FromArgb(120, 50, 45))) g.FillEllipse(dot, b.X + 10, b.Y + 9, 12, 12);
-        TimeSpan t = DateTime.Now - started;
-        string text = string.Format("REC  {0}:{1:00}   Alt+S", (int)t.TotalMinutes, t.Seconds);
-        TextRenderer.DrawText(g, text, font, new Rectangle(b.X + 28, b.Y, b.Width - 28, b.Height), Color.White, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding);
+        Color dot = !recording ? Color.FromArgb(120, 120, 115) : blink ? Color.FromArgb(240, 68, 56) : Color.FromArgb(120, 50, 45);
+        using (var br = new SolidBrush(dot)) g.FillEllipse(br, 12, Strip / 2 - 6, 12, 12);
     }
 
     protected override void Dispose(bool disposing)
@@ -740,7 +796,7 @@ class Overlay : Form
         get
         {
             if (Recorder.Active) return "Recording in progress  ·  drag a box to copy it  ·  Esc cancels";
-            if (Recording) return "Drag a box to record it as a video  ·  Alt+S stops  ·  Esc cancels";
+            if (Recording) return "Drag a box to record  ·  then press Record above it  ·  Esc cancels";
             return "Drag a box to copy it  ·  hold Shift to record a video instead  ·  Esc cancels";
         }
     }

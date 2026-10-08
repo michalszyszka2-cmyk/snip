@@ -1,12 +1,12 @@
 # Snip
 
-A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** together, drag a box, and that part of the screen is on your clipboard. Paste it anywhere with Ctrl+V. Hold **Shift** while you drag and the box is recorded as a video instead, with your voice, until you press **Alt+S**.
+A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** together, drag a box, and that part of the screen is on your clipboard. Paste it anywhere with Ctrl+V. Hold **Shift** while you drag and a red frame with **Record** and **Stop & save** buttons appears round the box: press Record, talk, press Stop, and the video is in Downloads.
 
 - No window and nothing to switch on: it starts with Windows and waits in the tray.
 - The screen freezes and dims while you drag, so menus and tooltips stay put.
 - Snips are shrunk to at most 1568 px on the long side, which keeps big ones small (a full 4K screen comes out around 0.3 MB). That's the size Claude and most chat tools scale images down to anyway.
 - Snips are never saved to disk. **Esc** cancels.
-- Recordings go to your **Downloads** folder as `recording-YYYY-MM-DD-HHMM.mp4` (H.264 + AAC, 30 fps, playable anywhere). The tray icon turns into a red dot while recording; click it, press Alt+S, or use the tray menu to stop.
+- Recordings go to your **Downloads** folder as `recording-YYYY-MM-DD-HHMM.mp4` (H.264 + AAC, 30 fps, playable anywhere). The frame stays round the area while recording with a timer; nothing of it is in the video. Stop with the frame's button, Alt+S, a click on the red tray dot, or the tray menu.
 - Recording uses [FFmpeg](https://ffmpeg.org/). If it isn't on the computer, Snip offers to download it the first time you record (about 115 MB, kept in Snip's own folder).
 
 ## Install
@@ -23,8 +23,9 @@ Because the exe isn't code-signed, Windows may show **"Windows protected your PC
 | | |
 |---|---|
 | **Ctrl + ' + #** | Start a snip, then drag a box |
-| **Shift** while dragging | Record that box as a video instead of copying it |
-| **Alt+S** | Stop the recording and save it |
+| **Shift** while dragging | Frame that box for recording; then press **Record** on the frame |
+| **Stop & save** on the frame, or **Alt+S** | Stop the recording and save it |
+| **✕** on the frame | Cancel (or stop, if recording) |
 | **Esc** | Cancel |
 | Right-click the tray camera | Snip now / Record an area / Record the whole screen / Microphone / Open the recordings folder / Quit / Uninstall |
 
