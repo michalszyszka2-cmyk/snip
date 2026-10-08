@@ -649,21 +649,27 @@ class KeyHook : IDisposable
     public void Dispose() { UnhookWindowsHookEx(handle); }
 }
 
-// Red frame round the chosen area with a strip of buttons above it: Record starts the
-// recording, Stop finishes it, X cancels. The frame's window region is only the border and
-// the strip, so the inside is a real hole (clicks go to whatever is underneath) and the
-// border sits just outside the recorded box, so nothing of it is in the video.
+// Red frame round the chosen area with a floating pill above it, in the style of the
+// Windows Snipping Tool's recording bar: one round button that is Record and, once
+// recording, becomes Stop in the same place; a timer beside it; a small X to cancel.
+// The pill is owner-drawn (no WinForms buttons). The window region is only the pill and
+// the border ring, so the inside is a real hole and nothing of the frame is in the video.
 class RecFrame : Form
 {
-    const int Border = 4, Strip = 48;
+    const int Border = 4, Strip = 64, PillH = 52;   // Strip = pill height + gap above the box
     readonly Rectangle area;      // screen coordinates of what ffmpeg records
     readonly Action onRecord, onStop, onCancel;
     readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer { Interval = 500 };
-    readonly Font font = new Font("Segoe UI", 10f, FontStyle.Bold);
-    readonly Button recBtn, stopBtn, closeBtn;
-    readonly Label timeLbl;
+    readonly Font font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
+    readonly Font timeFont = new Font("Consolas", 12f, FontStyle.Bold);
     DateTime started;
-    bool recording, blink;
+    bool recording, blink, stopping;
+    Rectangle pill, mainBtn, closeBtn;   // client coordinates
+    int hover = 0;                        // 0 none, 1 main, 2 close
+    bool pressed;
+
+    static readonly Color Red = Color.FromArgb(232, 52, 46), RedHover = Color.FromArgb(250, 76, 68), RedDark = Color.FromArgb(180, 36, 32);
+    static readonly Color Ink = Color.FromArgb(32, 32, 30), Edge = Color.FromArgb(70, 70, 66), Muted = Color.FromArgb(170, 170, 164);
 
     public RecFrame(Rectangle area, Action onRecord, Action onStop, Action onCancel)
     {
@@ -672,60 +678,43 @@ class RecFrame : Form
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
         TopMost = true;
-        BackColor = Color.FromArgb(29, 29, 27);
-        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        BackColor = Ink;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
-        timeLbl = new Label { AutoSize = false, Text = "Ready", ForeColor = Color.White, Font = font, TextAlign = ContentAlignment.MiddleLeft };
-        recBtn = MakeButton("Record", Color.FromArgb(240, 68, 56));
-        stopBtn = MakeButton("Stop & save", Color.FromArgb(58, 58, 55));
-        closeBtn = MakeButton("✕", Color.FromArgb(58, 58, 55));
-        stopBtn.Enabled = false;
-        recBtn.Click += (s, e) => onRecord();
-        stopBtn.Click += (s, e) => { stopBtn.Enabled = false; onStop(); };
-        closeBtn.Click += (s, e) => onCancel();
-        Controls.AddRange(new Control[] { timeLbl, recBtn, stopBtn, closeBtn });
+        // pill: [ (o) Record ] [ 00:00 ] | [ x ] - measured so 200 % DPI does not clip anything
+        int labelW = Math.Max(TextRenderer.MeasureText("Stop & save", font).Width, TextRenderer.MeasureText("Saving...", font).Width);
+        int timeW = TextRenderer.MeasureText("00:00", timeFont).Width + 14;
+        int btnH = PillH - 12;
+        int mainW = 8 + (btnH - 16) + 8 + labelW + 16;
+        int pillW = 6 + mainW + 12 + timeW + 12 + 9 + btnH + 6;
+        int ringW = area.Width + 2 * Border;
+        int pillX = Math.Max(0, (ringW - pillW) / 2);          // centred over the box
+        int formW = Math.Max(ringW, pillX + pillW);
+        Bounds = new Rectangle(area.X - Border, area.Y - Strip, formW, area.Height + Border + Strip);
 
-        // strip: [dot + time] [Record] [Stop & save] [x], at least as wide as its contents
-        int x = 34, h = Strip - 12, y = 6;
-        timeLbl.SetBounds(x, y, TextRenderer.MeasureText("00:00", font).Width + 8, h); x = timeLbl.Right + 8;
-        foreach (var b in new[] { recBtn, stopBtn })
-        {
-            b.SetBounds(x, y, TextRenderer.MeasureText(b.Text, b.Font).Width + 28, h); x = b.Right + 6;
-        }
-        closeBtn.SetBounds(x, y, h, h); x = closeBtn.Right + 10;
-        int stripW = Math.Max(x, area.Width + 2 * Border);
-        Bounds = new Rectangle(area.X - Border, area.Y - Strip, stripW, area.Height + Border + Strip);
+        pill = new Rectangle(pillX, 0, pillW, PillH);
+        mainBtn = new Rectangle(pill.X + 6, pill.Y + 6, mainW, btnH);
+        closeBtn = new Rectangle(pill.Right - 6 - btnH, pill.Y + 6, btnH, btnH);
 
-        // window region = strip + border ring; the inside is not part of the window at all
         var path = new GraphicsPath(FillMode.Alternate);
-        path.AddRectangle(new Rectangle(0, 0, stripW, Strip));
-        path.AddRectangle(new Rectangle(0, Strip - Border, area.Width + 2 * Border, area.Height + 2 * Border));
+        path.AddPath(Rounded(pill, PillH / 2), false);
+        path.AddRectangle(new Rectangle(0, Strip - Border, ringW, area.Height + 2 * Border));
         path.AddRectangle(new Rectangle(Border, Strip, area.Width, area.Height));
         Region = new Region(path);
 
-        tick.Tick += (s, e) =>
-        {
-            blink = !blink;
-            if (recording) { TimeSpan t = DateTime.Now - started; timeLbl.Text = string.Format("{0}:{1:00}", (int)t.TotalMinutes, t.Seconds); }
-            Invalidate(new Rectangle(0, 0, 34, Strip));
-        };
+        tick.Tick += (s, e) => { blink = !blink; Invalidate(pill); };
         tick.Start();
     }
 
-    static Button MakeButton(string text, Color back)
+    static GraphicsPath Rounded(Rectangle r, int radius)
     {
-        var b = new Button { Text = text, UseMnemonic = false, FlatStyle = FlatStyle.Flat, BackColor = back, ForeColor = Color.White, Font = new Font("Segoe UI", 10f, FontStyle.Bold), Cursor = Cursors.Hand, TabStop = false };
-        b.FlatAppearance.BorderSize = 0;
-        return b;
+        var p = new GraphicsPath(); int d = radius * 2;
+        p.AddArc(r.X, r.Y, d, d, 180, 90); p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+        p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90); p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+        p.CloseFigure(); return p;
     }
 
-    public void Started()
-    {
-        recording = true; started = DateTime.Now;
-        recBtn.Visible = false;
-        stopBtn.Enabled = true; stopBtn.BackColor = Color.FromArgb(240, 68, 56);
-        timeLbl.Text = "0:00";
-    }
+    public void Started() { recording = true; started = DateTime.Now; Invalidate(pill); }
 
     protected override CreateParams CreateParams
     {
@@ -733,22 +722,101 @@ class RecFrame : Form
     }
     protected override bool ShowWithoutActivation { get { return true; } }
 
+    int Hit(Point p) { return mainBtn.Contains(p) ? 1 : closeBtn.Contains(p) ? 2 : 0; }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        int h = Hit(e.Location);
+        Cursor = h != 0 ? Cursors.Hand : Cursors.Default;
+        if (h != hover) { hover = h; Invalidate(pill); }
+    }
+    protected override void OnMouseLeave(EventArgs e) { if (hover != 0 || pressed) { hover = 0; pressed = false; Invalidate(pill); } }
+    protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left && Hit(e.Location) != 0) { pressed = true; Invalidate(pill); } }
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        bool was = pressed; pressed = false; Invalidate(pill);
+        if (!was) return;
+        switch (Hit(e.Location))
+        {
+            case 1:
+                if (stopping) break;
+                if (recording) { stopping = true; onStop(); }
+                else onRecord();
+                break;
+            case 2: onCancel(); break;
+        }
+    }
+
     protected override void OnPaint(PaintEventArgs e)
     {
         var g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
-        using (var p = new Pen(Color.FromArgb(240, 68, 56), Border))
+        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+
+        // border ring round the recorded box
+        using (var p = new Pen(Red, Border))
         {
             p.Alignment = PenAlignment.Inset;
             g.DrawRectangle(p, new Rectangle(0, Strip - Border, area.Width + 2 * Border, area.Height + 2 * Border));
         }
-        Color dot = !recording ? Color.FromArgb(120, 120, 115) : blink ? Color.FromArgb(240, 68, 56) : Color.FromArgb(120, 50, 45);
-        using (var br = new SolidBrush(dot)) g.FillEllipse(br, 12, Strip / 2 - 6, 12, 12);
+
+        // the pill
+        using (var path = Rounded(pill, PillH / 2))
+        using (var fill = new SolidBrush(Ink))
+        using (var edge = new Pen(Edge, 1))
+        {
+            g.FillPath(fill, path);
+            var inner = pill; inner.Inflate(-1, -1);
+            using (var ip = Rounded(inner, PillH / 2 - 1)) g.DrawPath(edge, ip);
+        }
+
+        // main button: red pill; (o) Record  ->  [square] Stop & save
+        bool mainHot = hover == 1;
+        Color back = stopping ? RedDark : pressed && mainHot ? RedDark : mainHot ? RedHover : Red;
+        using (var path = Rounded(mainBtn, mainBtn.Height / 2))
+        using (var br = new SolidBrush(back)) g.FillPath(br, path);
+        int ic = mainBtn.Height - 16;                                   // icon size
+        var icon = new Rectangle(mainBtn.X + 8, mainBtn.Y + 8, ic, ic);
+        using (var white = new SolidBrush(Color.White))
+        {
+            if (!recording)
+            {
+                g.FillEllipse(white, icon);
+                using (var rp = new SolidBrush(back)) g.FillEllipse(rp, Rectangle.Inflate(icon, -3, -3));
+                g.FillEllipse(white, Rectangle.Inflate(icon, -6, -6));
+            }
+            else using (var sq = Rounded(Rectangle.Inflate(icon, -3, -3), 3)) g.FillPath(white, sq);
+        }
+        string label = stopping ? "Saving..." : recording ? "Stop & save" : "Record";
+        var labelRect = new Rectangle(icon.Right + 8, mainBtn.Y, mainBtn.Right - icon.Right - 8, mainBtn.Height);
+        TextRenderer.DrawText(g, label, font, labelRect, Color.White, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+
+        // timer, with a blinking dot while recording
+        string time = recording ? Elapsed() : "0:00";
+        var timeRect = new Rectangle(mainBtn.Right + 12, pill.Y, closeBtn.X - 9 - (mainBtn.Right + 12), PillH);
+        if (recording)
+        {
+            using (var br = new SolidBrush(blink ? Red : RedDark)) g.FillEllipse(br, timeRect.X, pill.Y + PillH / 2 - 4, 8, 8);
+            timeRect.X += 14; timeRect.Width -= 14;
+        }
+        TextRenderer.DrawText(g, time, timeFont, timeRect, recording ? Color.White : Muted, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+
+        // divider + close
+        using (var dp = new Pen(Edge, 1)) g.DrawLine(dp, closeBtn.X - 8, pill.Y + 14, closeBtn.X - 8, pill.Bottom - 14);
+        if (hover == 2) using (var br = new SolidBrush(Color.FromArgb(60, 60, 57))) g.FillEllipse(br, closeBtn);
+        using (var xp = new Pen(hover == 2 ? Color.White : Muted, 2f))
+        {
+            int cx = closeBtn.X + closeBtn.Width / 2, cy = closeBtn.Y + closeBtn.Height / 2, r = 5;
+            g.DrawLine(xp, cx - r, cy - r, cx + r, cy + r); g.DrawLine(xp, cx - r, cy + r, cx + r, cy - r);
+        }
     }
+
+    string Elapsed() { TimeSpan t = DateTime.Now - started; return string.Format("{0}:{1:00}", (int)t.TotalMinutes, t.Seconds); }
 
     protected override void Dispose(bool disposing)
     {
-        if (disposing) { tick.Dispose(); font.Dispose(); }
+        if (disposing) { tick.Dispose(); font.Dispose(); timeFont.Dispose(); }
         base.Dispose(disposing);
     }
 }

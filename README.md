@@ -1,6 +1,6 @@
 # Snip
 
-A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** together, drag a box, and that part of the screen is on your clipboard. Paste it anywhere with Ctrl+V. Hold **Shift** while you drag and a red frame with **Record** and **Stop & save** buttons appears round the box: press Record, talk, press Stop, and the video is in Downloads.
+A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** together, drag a box, and that part of the screen is on your clipboard. Paste it anywhere with Ctrl+V. Hold **Shift** while you drag and a red frame appears round the box with a small bar above it: press **Record**, talk, press the same button (now **Stop & save**), and the video is in Downloads.
 
 - No window and nothing to switch on: it starts with Windows and waits in the tray.
 - The screen freezes and dims while you drag, so menus and tooltips stay put.
