@@ -7,6 +7,8 @@ A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** toge
 - Snips are shrunk to at most 1568 px on the long side, which keeps big ones small (a full 4K screen comes out around 0.3 MB). That's the size Claude and most chat tools scale images down to anyway.
 - Snips are never saved to disk. **Esc** cancels.
 - Recordings go to your **Downloads** folder as `recording-YYYY-MM-DD-HHMM.mp4` (H.264 + AAC, 30 fps, playable anywhere). The frame stays round the area while recording with a timer; nothing of it is in the video. Stop with the frame's button, Alt+S, a click on the red tray dot, or the tray menu; Explorer then opens Downloads with the new file selected.
+- **Camera, like Loom:** your webcam shows as a round bubble in the corner of the recording. Drag it anywhere, double-click it to change its size, or hide it with the camera button on the bar. *Record the camera only* in the tray menu records just you.
+- **Pause, resume, start over.** Recording starts after a 3, 2, 1 countdown. Pause leaves the pause out of the video; Start over throws the take away and gets you ready again.
 - Recording uses [FFmpeg](https://ffmpeg.org/). If it isn't on the computer, Snip offers to download it the first time you record (about 115 MB, kept in Snip's own folder).
 
 ## Install
@@ -25,11 +27,12 @@ Because the exe isn't code-signed, Windows may show **"Windows protected your PC
 | **Ctrl + ' + #** | Start a snip, then drag a box |
 | **Shift** while dragging | Frame that box for recording; then press **Record** on the frame |
 | **Stop & save** on the frame, or **Alt+S** | Stop the recording and save it |
-| **✕** on the frame | Cancel (or stop, if recording) |
+| Pause / Start over / camera icons on the bar | Pause or resume, throw the take away and start again, show or hide the camera bubble |
+| **✕** on the frame | Close; while recording, asks before throwing the recording away |
 | **Esc** | Cancel |
-| Right-click the tray camera | Snip now / Record an area / Record the whole screen / Microphone / Open the recordings folder / Quit / Uninstall |
+| Right-click the tray camera | Snip now / Record an area / Record the whole screen / Record the camera only / Pause / Camera / Microphone / Open the recordings folder / Quit / Uninstall |
 
-The **Microphone** menu lists what Windows sees; the first one is used until you pick another, and "No microphone" records silent video. Computer sound (what the speakers play) is not recorded.
+The **Camera** menu picks the webcam, or "No camera". The **Microphone** menu lists what Windows sees; the first one is used until you pick another, and "No microphone" records silent video. Computer sound (what the speakers play) is not recorded.
 
 The shortcut uses the `'` and `#` keys of a UK keyboard (next to Enter). On other layouts it uses whichever keys type `'` and `#`.
 
