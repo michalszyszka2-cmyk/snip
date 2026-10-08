@@ -396,6 +396,7 @@ class TrayApp : ApplicationContext
     readonly Control pump = new Control(); // marshals the hook callback onto the UI thread
     readonly Icon cameraIcon, recIcon;
     readonly ToolStripMenuItem stopItem, micMenu;
+    RecFrame frame;
     bool busy;
 
     public TrayApp()
@@ -454,6 +455,8 @@ class TrayApp : ApplicationContext
     {
         if (Recorder.Active) return;
         if (!Recorder.Start(area, CurrentMic())) return;
+        frame = new RecFrame(area);
+        frame.Show();
         tray.Icon = recIcon;
         tray.Text = "Snip  -  recording, Alt+S to stop";
         tray.ShowBalloonTip(3000, "Recording", "Stop with Alt+S, or click the red tray icon.", ToolTipIcon.None);
@@ -461,6 +464,7 @@ class TrayApp : ApplicationContext
 
     void OnFinished(string file, string error)
     {
+        if (frame != null) { frame.Close(); frame.Dispose(); frame = null; }
         tray.Icon = cameraIcon;
         tray.Text = "Snip  -  Ctrl + ' + #";
         if (file != null)
@@ -624,6 +628,72 @@ class KeyHook : IDisposable
 
     static bool IsDown(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
     public void Dispose() { UnhookWindowsHookEx(handle); }
+}
+
+// Red border round the area being recorded, with a blinking REC badge and timer. It sits
+// just OUTSIDE the box and is click-through, so it never shows up in the video itself.
+class RecFrame : Form
+{
+    const int Border = 4, Pad = 44;
+    readonly Rectangle area;      // screen coordinates of what ffmpeg records
+    readonly DateTime started = DateTime.Now;
+    readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer { Interval = 500 };
+    readonly Font font = new Font("Segoe UI", 10f, FontStyle.Bold);
+    bool blink;
+
+    public RecFrame(Rectangle area)
+    {
+        this.area = area;
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = false;
+        TopMost = true;
+        BackColor = Color.FromArgb(1, 2, 3);
+        TransparencyKey = BackColor;   // everything painted in this colour is a hole
+        Bounds = new Rectangle(area.X - Border, area.Y - Pad, area.Width + 2 * Border, area.Height + Border + Pad);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        tick.Tick += (s, e) => { blink = !blink; Invalidate(Badge); };
+        tick.Start();
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get
+        {
+            var cp = base.CreateParams;
+            cp.ExStyle |= 0x20 | 0x80 | 0x08000000;   // WS_EX_TRANSPARENT (click-through), TOOLWINDOW, NOACTIVATE
+            return cp;
+        }
+    }
+
+    protected override bool ShowWithoutActivation { get { return true; } }
+
+    Rectangle Box { get { return new Rectangle(Border, Pad, area.Width, area.Height); } }
+    Rectangle Badge { get { return new Rectangle(Border, Pad - 36, TextRenderer.MeasureText("REC  00:00   Alt+S", font).Width + 44, 30); } }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        Rectangle box = Box;
+        using (var p = new Pen(Color.FromArgb(240, 68, 56), Border))
+        {
+            p.Alignment = PenAlignment.Inset;
+            g.DrawRectangle(p, new Rectangle(0, Pad - Border, box.Width + 2 * Border, box.Height + 2 * Border));
+        }
+        Rectangle b = Badge;
+        using (var bg = new SolidBrush(Color.FromArgb(29, 29, 27))) g.FillRectangle(bg, b);
+        using (var dot = new SolidBrush(blink ? Color.FromArgb(240, 68, 56) : Color.FromArgb(120, 50, 45))) g.FillEllipse(dot, b.X + 10, b.Y + 9, 12, 12);
+        TimeSpan t = DateTime.Now - started;
+        string text = string.Format("REC  {0}:{1:00}   Alt+S", (int)t.TotalMinutes, t.Seconds);
+        TextRenderer.DrawText(g, text, font, new Rectangle(b.X + 28, b.Y, b.Width - 28, b.Height), Color.White, TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.NoPadding);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) { tick.Dispose(); font.Dispose(); }
+        base.Dispose(disposing);
+    }
 }
 
 // Full-screen frozen, dimmed copy of the desktop. Drag a box; the box is copied bright.
