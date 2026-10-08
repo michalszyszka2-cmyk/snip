@@ -1,11 +1,13 @@
 # Snip
 
-A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** together, drag a box, and that part of the screen is on your clipboard. Paste it anywhere with Ctrl+V.
+A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** together, drag a box, and that part of the screen is on your clipboard. Paste it anywhere with Ctrl+V. Hold **Shift** while you drag and the box is recorded as a video instead, with your voice, until you press **Alt+S**.
 
 - No window and nothing to switch on: it starts with Windows and waits in the tray.
 - The screen freezes and dims while you drag, so menus and tooltips stay put.
 - Snips are shrunk to at most 1568 px on the long side, which keeps big ones small (a full 4K screen comes out around 0.3 MB). That's the size Claude and most chat tools scale images down to anyway.
-- Nothing is saved to disk. **Esc** cancels.
+- Snips are never saved to disk. **Esc** cancels.
+- Recordings go to your **Downloads** folder as `recording-YYYY-MM-DD-HHMM.mp4` (H.264 + AAC, 30 fps, playable anywhere). The tray icon turns into a red dot while recording; click it, press Alt+S, or use the tray menu to stop.
+- Recording uses [FFmpeg](https://ffmpeg.org/). If it isn't on the computer, Snip offers to download it the first time you record (about 115 MB, kept in Snip's own folder).
 
 ## Install
 
@@ -21,8 +23,12 @@ Because the exe isn't code-signed, Windows may show **"Windows protected your PC
 | | |
 |---|---|
 | **Ctrl + ' + #** | Start a snip, then drag a box |
+| **Shift** while dragging | Record that box as a video instead of copying it |
+| **Alt+S** | Stop the recording and save it |
 | **Esc** | Cancel |
-| Right-click the tray camera | Snip now / Quit / Uninstall |
+| Right-click the tray camera | Snip now / Record an area / Record the whole screen / Microphone / Open the recordings folder / Quit / Uninstall |
+
+The **Microphone** menu lists what Windows sees; the first one is used until you pick another, and "No microphone" records silent video. Computer sound (what the speakers play) is not recorded.
 
 The shortcut uses the `'` and `#` keys of a UK keyboard (next to Enter). On other layouts it uses whichever keys type `'` and `#`.
 
