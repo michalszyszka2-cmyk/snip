@@ -488,7 +488,8 @@ class TrayApp : ApplicationContext
         if (file != null)
         {
             SystemSounds.Asterisk.Play();
-            tray.ShowBalloonTip(5000, "Saved to Downloads", Path.GetFileName(file) + "  (click to open)", ToolTipIcon.None);
+            tray.ShowBalloonTip(5000, "Saved to Downloads", Path.GetFileName(file), ToolTipIcon.None);
+            Process.Start("explorer.exe", "/select,\"" + file + "\"");   // open Downloads with the new file selected
         }
         else MessageBox.Show("Recording failed.\n\n" + error, "Snip", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }

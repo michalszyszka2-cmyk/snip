@@ -6,7 +6,7 @@ A tiny Windows snipping tool that lives in the tray. Press **Ctrl + ' + #** toge
 - The screen freezes and dims while you drag, so menus and tooltips stay put.
 - Snips are shrunk to at most 1568 px on the long side, which keeps big ones small (a full 4K screen comes out around 0.3 MB). That's the size Claude and most chat tools scale images down to anyway.
 - Snips are never saved to disk. **Esc** cancels.
-- Recordings go to your **Downloads** folder as `recording-YYYY-MM-DD-HHMM.mp4` (H.264 + AAC, 30 fps, playable anywhere). The frame stays round the area while recording with a timer; nothing of it is in the video. Stop with the frame's button, Alt+S, a click on the red tray dot, or the tray menu.
+- Recordings go to your **Downloads** folder as `recording-YYYY-MM-DD-HHMM.mp4` (H.264 + AAC, 30 fps, playable anywhere). The frame stays round the area while recording with a timer; nothing of it is in the video. Stop with the frame's button, Alt+S, a click on the red tray dot, or the tray menu; Explorer then opens Downloads with the new file selected.
 - Recording uses [FFmpeg](https://ffmpeg.org/). If it isn't on the computer, Snip offers to download it the first time you record (about 115 MB, kept in Snip's own folder).
 
 ## Install
