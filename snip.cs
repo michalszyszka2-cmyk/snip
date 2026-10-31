@@ -1,5 +1,5 @@
 // Background snipping tool. Sits in the tray; press Ctrl + ' + # (all held together),
-// drag a box, and that part of the screen lands on the clipboard. Hold Shift while you
+// drag a box, and that part of the screen lands on the clipboard. Hold Ctrl while you
 // drag and the box is recorded as a video (voice, optional webcam bubble, pause). Esc cancels.
 // Build: build.cmd  ->  snip.exe. The exe installs itself: run it from anywhere and it
 // copies itself to %LOCALAPPDATA%\Programs\Snip, adds Startup + Desktop shortcuts, starts.
@@ -24,12 +24,14 @@ static class Program
     [DllImport("user32.dll")] static extern bool SetProcessDPIAware();
 
     [STAThread]
-    static void Main()
+    static void Main(string[] args)
     {
         // Before any window: sharp text at the real screen scale, modern controls.
         SetProcessDPIAware();
         Application.EnableVisualStyles();
 
+        // Settings > Apps runs the installed exe with --uninstall
+        if (args.Length > 0 && args[0] == "--uninstall") { Installer.Uninstall(); return; }
         if (!Installer.IsInstalledCopy()) { Installer.Install(); return; }
 
         bool first;
@@ -49,6 +51,7 @@ static class Installer
     static string StartupLink { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), "Snip.lnk"); } }
     static string DesktopLink { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "Snip.lnk"); } }
     static string Self { get { return Process.GetCurrentProcess().MainModule.FileName; } }
+    const string UninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\Snip";
 
     public static bool IsInstalledCopy()
     {
@@ -64,10 +67,12 @@ static class Installer
             File.Copy(Self, Exe, true);
             MakeShortcut(StartupLink);
             MakeShortcut(DesktopLink);
+            try { RegisterUninstall(); } catch { }
             Process.Start(Exe);
             MessageBox.Show("Snip is installed and running.\n\nPress Ctrl + ' + # together, drag a box, then paste with Ctrl+V.\n" +
-                "Hold Shift while dragging to record that box as a video; Alt+S stops.\n" +
-                "It starts with Windows. Right-click the camera icon by the clock to quit or uninstall.",
+                "Hold Ctrl while dragging to record that box as a video; Alt+S stops.\n" +
+                "It starts with Windows. Click the camera icon by the clock for the menu.\n" +
+                "To remove it, use Windows Settings > Apps, like any program.",
                 "Snip", MessageBoxButtons.OK, MessageBoxIcon.Information);
         }
         catch (Exception ex)
@@ -76,15 +81,35 @@ static class Installer
         }
     }
 
+    // Shows Snip in Settings > Apps > Installed apps, with Uninstall running this exe with --uninstall.
+    static void RegisterUninstall()
+    {
+        using (var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(UninstallKey))
+        {
+            k.SetValue("DisplayName", "Snip");
+            k.SetValue("DisplayIcon", Exe);
+            k.SetValue("DisplayVersion", "1.2");
+            k.SetValue("Publisher", "Michal Szyszka");
+            k.SetValue("InstallLocation", Dir);
+            k.SetValue("UninstallString", "\"" + Exe + "\" --uninstall");
+            k.SetValue("NoModify", 1, Microsoft.Win32.RegistryValueKind.DWord);
+            k.SetValue("NoRepair", 1, Microsoft.Win32.RegistryValueKind.DWord);
+            k.SetValue("EstimatedSize", (int)(new FileInfo(Exe).Length / 1024), Microsoft.Win32.RegistryValueKind.DWord);
+        }
+    }
+
+    // Run by Settings > Apps (a second copy of the exe, while the tray one is still up).
     public static void Uninstall()
     {
-        if (MessageBox.Show("Remove Snip from this computer?", "Snip", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+        if (MessageBox.Show("Remove Snip from this computer?\n\nThis closes Snip and deletes its folder, shortcuts and settings. " +
+                "Your recordings in Downloads stay.", "Snip", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
             return;
+        StopRunning();
         foreach (var link in new[] { StartupLink, DesktopLink }) if (File.Exists(link)) File.Delete(link);
-        // the running exe can't delete itself; a short-lived cmd removes the folder after we exit
+        try { Microsoft.Win32.Registry.CurrentUser.DeleteSubKeyTree(UninstallKey, false); } catch { }
+        // this exe is inside the folder and can't delete itself; a short-lived cmd removes it after we exit
         Process.Start(new ProcessStartInfo("cmd.exe", "/c timeout /t 2 /nobreak >nul & rmdir /s /q \"" + Dir + "\"")
             { CreateNoWindow = true, UseShellExecute = false });
-        Application.Exit();
     }
 
     // An older copy holds the file open, so close it before overwriting.
@@ -128,7 +153,7 @@ static class Installer
     }
 }
 
-// key=value lines in settings.txt next to the exe: mic, cam, cam_on, cam_shape, cam_bg, cam_bg_pic.
+// key=value lines in settings.txt next to the exe: mic, cam, cam_on, cam_shape, cam_bg, cam_bg_pic, phone_on, phone_bg, phone_bg_pic.
 static class Settings
 {
     static readonly string File_ = Path.Combine(Installer.Dir, "settings.txt");
@@ -227,12 +252,17 @@ static class Ffmpeg
     public static List<Mic> ListMics() { return ListDevices("audio"); }
     public static List<Mic> ListCams() { return ListDevices("video"); }
 
+    static string listCache; static DateTime listAt;
+
     public static List<Mic> ListDevices(string kind)
     {
         var mics = new List<Mic>();
         string exe = Find();
         if (exe == null) return mics;
-        string err = Run(exe, "-hide_banner -list_devices true -f dshow -i dummy", 8000);
+        // the panel asks for cameras and mics several times per rebuild: one ffmpeg run serves them all
+        string err;
+        if (listCache != null && (DateTime.Now - listAt).TotalSeconds < 3) err = listCache;
+        else { err = listCache = Run(exe, "-hide_banner -list_devices true -f dshow -i dummy", 8000); listAt = DateTime.Now; }
         Mic last = null;
         foreach (Match m in Regex.Matches(err, "\"([^\"]+)\"\\s+\\((audio|video|none)\\)|Alternative name \"([^\"]+)\""))
         {
@@ -254,7 +284,8 @@ static class Ffmpeg
     }
 }
 
-// One recording at a time: ffmpeg grabs the screen area (gdigrab) and the chosen mic
+// One recording at a time: ffmpeg grabs the screen area (gdigrab; for a framed box that can be
+// dragged mid-recording, Snip's own Grabber feeds it the frames) and the chosen mic
 // (DirectShow), encodes H.264 + AAC. ffmpeg cannot pause, so each stretch between Pause and
 // Resume is its own segment file in %TEMP%; Stop joins them losslessly (concat, -c copy)
 // into the mp4 in Downloads. "q" on stdin ends a segment cleanly so it is playable.
@@ -303,8 +334,11 @@ static class Recorder
 
     enum After { None, Pause, Finish, Cancel }
     static Process proc;            // the running segment, null while paused
+    static Grabber grab;            // feeds proc its frames when the box can move
     static string exe, segFile;
     static Rectangle area;
+    static bool movable;
+    static readonly object areaLock = new object();
     static Mic mic;
     static readonly List<string> segs = new List<string>();
     static After after;
@@ -337,7 +371,9 @@ static class Recorder
         get { return done + (proc != null && !Paused && after == After.None ? DateTime.Now - segStart : TimeSpan.Zero); }
     }
 
-    public static bool Start(Rectangle a, Mic m)
+    // movable: the box may be dragged mid-recording, so Snip grabs the frames itself (Grabber)
+    // instead of gdigrab, which only ever films the rectangle it was started with.
+    public static bool Start(Rectangle a, Mic m, bool canMove)
     {
         if (Active) return false;
         exe = Ffmpeg.Ensure();
@@ -345,7 +381,7 @@ static class Recorder
         // encoders want even sizes
         a.Width &= ~1; a.Height &= ~1;
         if (a.Width < 2 || a.Height < 2) return false;
-        area = a; mic = m;
+        area = a; mic = m; movable = canMove;
 
         string file = Path.Combine(DownloadsDir(), "recording-" + DateTime.Now.ToString("yyyy-MM-dd-HHmm") + ".mp4");
         for (int n = 2; File.Exists(file); n++)
@@ -361,8 +397,14 @@ static class Recorder
     {
         segFile = Path.Combine(Path.GetTempPath(), "snip-seg-" + DateTime.Now.Ticks + ".mp4");
         var a = new StringBuilder("-hide_banner -loglevel error -y ");
-        a.AppendFormat("-thread_queue_size 1024 -f gdigrab -framerate 30 -offset_x {0} -offset_y {1} -video_size {2}x{3} -draw_mouse 1 -i desktop ",
-            area.X, area.Y, area.Width, area.Height);
+        // Grabber frames are stamped with the wall clock as ffmpeg reads them, the same clock gdigrab uses,
+        // so the mic shift below lines them up the same way.
+        if (movable)
+            a.AppendFormat("-thread_queue_size 1024 -f rawvideo -pix_fmt bgr0 -video_size {0}x{1} -framerate 30 -use_wallclock_as_timestamps 1 -i - ",
+                area.Width, area.Height);
+        else
+            a.AppendFormat("-thread_queue_size 1024 -f gdigrab -framerate 30 -offset_x {0} -offset_y {1} -video_size {2}x{3} -draw_mouse 1 -i desktop ",
+                area.X, area.Y, area.Width, area.Height);
         if (mic != null)
         {
             // gdigrab stamps frames with the epoch clock; dshow stamps audio with the system tick clock
@@ -374,6 +416,7 @@ static class Recorder
         }
         a.Append("-copyts -avoid_negative_ts make_zero -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -r 30 ");
         if (mic != null) a.Append("-c:a aac -b:a 160k -ac 1 ");
+        if (mic != null && movable) a.Append("-shortest ");   // no "q" with frames on stdin: the end of the frames ends the mic too
         a.Append('"').Append(segFile).Append('"');
 
         var psi = new ProcessStartInfo(exe, a.ToString())
@@ -397,13 +440,21 @@ static class Recorder
         p.BeginErrorReadLine();
         try { p.PriorityClass = ProcessPriorityClass.AboveNormal; } catch { }   // the mic must never wait for the camera effect
         p.Exited += (s, e) => ui.BeginInvoke(new Action(() => OnSegExit(p, errors)));
+        grab = movable ? new Grabber(p.StandardInput.BaseStream, area.Size, Where) : null;
+        if (grab != null) grab.Start();
         return true;
     }
 
-    // ffmpeg finishes the file after "q"; only kill it if it hangs
+    static Point Where() { lock (areaLock) return area.Location; }
+
+    // The box was dragged: the next frame comes from its new place. Size never changes.
+    public static void MoveTo(Point p) { lock (areaLock) area.Location = p; }
+
+    // ffmpeg finishes the file after "q" (or, fed by the Grabber, at the end of its input); only kill it if it hangs
     static void Quit(Process p)
     {
-        try { p.StandardInput.Write("q"); p.StandardInput.Flush(); } catch { }
+        if (grab != null) { grab.Stop(); grab = null; }   // stdin carries frames there, so no "q"
+        else try { p.StandardInput.Write("q"); p.StandardInput.Flush(); } catch { }
         var t = new System.Windows.Forms.Timer { Interval = 15000 };
         t.Tick += (s, e) => { t.Stop(); t.Dispose(); try { if (!p.HasExited) p.Kill(); } catch { } };
         t.Start();
@@ -442,7 +493,7 @@ static class Recorder
     {
         if (!Active) return;
         wantResume = false;
-        if (proc != null) { after = After.Cancel; try { proc.Kill(); } catch { } }
+        if (proc != null) { after = After.Cancel; if (grab != null) { grab.Stop(); grab = null; } try { proc.Kill(); } catch { } }
         else Done(null, null);
     }
 
@@ -450,6 +501,7 @@ static class Recorder
     {
         if (p != proc) return;
         proc = null;
+        if (grab != null) { grab.Stop(); grab = null; }   // ffmpeg died on its own
         int code = 0; try { code = p.ExitCode; } catch { }
         try { p.Dispose(); } catch { }
         After a = after;
@@ -497,6 +549,432 @@ static class Recorder
     }
 }
 
+// Copies the recording box off the screen 30 times a second, mouse pointer drawn in, and writes
+// the frames to ffmpeg's stdin, reading the box's place afresh each frame so it can be dragged
+// mid-recording. CAPTUREBLT takes in layered windows such as the camera bubble, as gdigrab does.
+// If ffmpeg falls behind, the write blocks and frames are skipped, never bunched up. Stop()
+// closes stdin, which ends ffmpeg's input and so finishes the segment file.
+class Grabber
+{
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateCompatibleDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr dc);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateDIBSection(IntPtr dc, ref BITMAPINFOHEADER bi, uint usage, out IntPtr bits, IntPtr section, uint offset);
+    [DllImport("gdi32.dll")] static extern IntPtr SelectObject(IntPtr dc, IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool DeleteObject(IntPtr obj);
+    [DllImport("gdi32.dll")] static extern bool BitBlt(IntPtr dst, int x, int y, int w, int h, IntPtr src, int sx, int sy, uint rop);
+    [DllImport("user32.dll")] static extern bool GetCursorInfo(ref CURSORINFO ci);
+    [DllImport("user32.dll")] static extern bool GetIconInfo(IntPtr icon, out ICONINFO ii);
+    [DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr dc, int x, int y, IntPtr icon, int w, int h, int step, IntPtr brush, int flags);
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint ms);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint ms);
+
+    [StructLayout(LayoutKind.Sequential)] struct BITMAPINFOHEADER
+    {
+        public int biSize, biWidth, biHeight; public short biPlanes, biBitCount;
+        public int biCompression, biSizeImage, biXPelsPerMeter, biYPelsPerMeter, biClrUsed, biClrImportant;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public Point pos; }
+    [StructLayout(LayoutKind.Sequential)] struct ICONINFO { public bool fIcon; public int xHotspot, yHotspot; public IntPtr hbmMask, hbmColor; }
+
+    const uint SRCCOPY = 0x00CC0020, CAPTUREBLT = 0x40000000;
+    const int Fps = 30;
+    readonly Stream sink;
+    readonly int w, h;
+    readonly Func<Point> where;
+    volatile bool stop;
+    IntPtr lastCursor; Point hotspot;
+
+    public Grabber(Stream sink, Size size, Func<Point> where) { this.sink = sink; w = size.Width; h = size.Height; this.where = where; }
+
+    public void Start() { new Thread(Run) { IsBackground = true, Priority = ThreadPriority.AboveNormal, Name = "snip-grab" }.Start(); }
+    public void Stop() { stop = true; }
+
+    void Run()
+    {
+        IntPtr screen = GetDC(IntPtr.Zero), mem = CreateCompatibleDC(screen), bits;
+        var bi = new BITMAPINFOHEADER { biSize = 40, biWidth = w, biHeight = -h, biPlanes = 1, biBitCount = 32 };   // top-down, BGRx
+        IntPtr dib = CreateDIBSection(mem, ref bi, 0, out bits, IntPtr.Zero, 0);
+        IntPtr old = SelectObject(mem, dib);
+        var buf = new byte[w * h * 4];
+        timeBeginPeriod(1);   // Sleep to the millisecond, not the 15.6 ms tick
+        var clock = Stopwatch.StartNew();
+        long n = 0;
+        try
+        {
+            while (!stop)
+            {
+                Point o = where();
+                BitBlt(mem, 0, 0, w, h, screen, o.X, o.Y, SRCCOPY | CAPTUREBLT);
+                DrawCursor(mem, o);
+                Marshal.Copy(bits, buf, 0, buf.Length);
+                sink.Write(buf, 0, buf.Length);
+                sink.Flush();
+                n++;
+                double now = clock.Elapsed.TotalMilliseconds, due = n * 1000.0 / Fps;
+                if (due > now) Thread.Sleep((int)(due - now));
+                else n = (long)(now * Fps / 1000);   // behind: carry on from now, don't burst to catch up
+            }
+        }
+        catch (IOException) { }               // ffmpeg went away (cancelled or failed)
+        catch (ObjectDisposedException) { }
+        finally
+        {
+            timeEndPeriod(1);
+            SelectObject(mem, old); DeleteObject(dib); DeleteDC(mem); ReleaseDC(IntPtr.Zero, screen);
+            try { sink.Close(); } catch { }
+        }
+    }
+
+    void DrawCursor(IntPtr dc, Point origin)
+    {
+        var ci = new CURSORINFO { cbSize = Marshal.SizeOf(typeof(CURSORINFO)) };
+        if (!GetCursorInfo(ref ci) || (ci.flags & 1) == 0 || ci.hCursor == IntPtr.Zero) return;   // 1 = CURSOR_SHOWING
+        if (ci.hCursor != lastCursor)
+        {
+            ICONINFO ii;
+            if (!GetIconInfo(ci.hCursor, out ii)) return;
+            if (ii.hbmMask != IntPtr.Zero) DeleteObject(ii.hbmMask);
+            if (ii.hbmColor != IntPtr.Zero) DeleteObject(ii.hbmColor);
+            lastCursor = ci.hCursor; hotspot = new Point(ii.xHotspot, ii.yHotspot);
+        }
+        DrawIconEx(dc, ci.pos.X - origin.X - hotspot.X, ci.pos.Y - origin.Y - hotspot.Y, ci.hCursor, 0, 0, 0, IntPtr.Zero, 3);   // DI_NORMAL
+    }
+}
+
+// The tray's one panel: every choice in view, no submenus. Opens on a click of the tray
+// icon, closes when it loses focus or on Esc, and follows the Windows light/dark setting.
+// Picks apply at once and the panel stays open; actions that open something close it first.
+class TrayPanel : Form
+{
+    [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+    [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    public class Item
+    {
+        public string Kind = "radio";   // action, rec, header, radio, chips, note, footer
+        public string Text, Hint;
+        public bool Checked, Enabled = true, CloseFirst;
+        public Action Click;
+        public Item Trail;              // small link at the right of an action or header row
+        public List<Item> Chips;        // chips, rec and footer rows
+        public Rectangle Rect;
+    }
+
+    readonly Func<List<Item>> build;
+    readonly float s = Dpi.Scale;
+    readonly Font font, bold, small, mono;
+    readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer { Interval = 500 };
+    readonly bool dark;
+    readonly Color bg, text, muted, line, hoverFill, chipFill, accent, red, amber;
+    List<Item> items = new List<Item>();
+    Item hover, pressed;
+    bool wasLive;
+
+    public TrayPanel(Func<List<Item>> build)
+    {
+        this.build = build;
+        dark = SystemDark();
+        accent = Accent();
+        bg = dark ? Color.FromArgb(32, 32, 30) : Color.FromArgb(249, 249, 249);
+        text = dark ? Color.FromArgb(240, 240, 236) : Color.FromArgb(27, 27, 27);
+        muted = dark ? Color.FromArgb(158, 158, 152) : Color.FromArgb(104, 104, 100);
+        line = dark ? Color.FromArgb(255, 255, 255) : Color.FromArgb(0, 0, 0);
+        hoverFill = dark ? Color.FromArgb(22, 255, 255, 255) : Color.FromArgb(14, 0, 0, 0);
+        chipFill = dark ? Color.FromArgb(28, 255, 255, 255) : Color.FromArgb(16, 0, 0, 0);
+        red = Color.FromArgb(232, 52, 46); amber = Color.FromArgb(255, 184, 77);
+        font = new Font("Segoe UI", 10f);
+        bold = new Font("Segoe UI", 10f, FontStyle.Bold);
+        small = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+        mono = new Font("Consolas", 11f, FontStyle.Bold);
+
+        FormBorderStyle = FormBorderStyle.None;
+        StartPosition = FormStartPosition.Manual;
+        ShowInTaskbar = false;
+        TopMost = true;
+        BackColor = bg;
+        KeyPreview = true;
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        Rebuild();
+        tick.Tick += (s_, e) =>
+        {
+            bool live = Recorder.Active;
+            if (live != wasLive) Rebuild(); else if (live) Invalidate();
+        };
+        tick.Start();
+    }
+
+    protected override CreateParams CreateParams
+    {
+        get { var cp = base.CreateParams; cp.ExStyle |= 0x80; cp.ClassStyle |= 0x20000; return cp; }   // TOOLWINDOW, DROPSHADOW
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        int round = 2;   // DWMWCP_ROUND; Windows 10 says no, so the region below does it there
+        if (DwmSetWindowAttribute(Handle, 33, ref round, 4) != 0) Region = new Region(RecFrame.Rounded(new Rectangle(0, 0, Width, Height), S(8)));
+    }
+
+    protected override void OnShown(EventArgs e) { base.OnShown(e); SetForegroundWindow(Handle); Activate(); }
+    protected override void OnDeactivate(EventArgs e) { base.OnDeactivate(e); Close(); }
+    protected override void OnFormClosed(FormClosedEventArgs e) { tick.Stop(); base.OnFormClosed(e); }
+    protected override void OnKeyDown(KeyEventArgs e) { if (e.KeyCode == Keys.Escape) Close(); base.OnKeyDown(e); }
+
+    // The taskbar and its flyouts follow SystemUsesLightTheme, not the apps setting.
+    static bool SystemDark()
+    {
+        try
+        {
+            using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"))
+            {
+                object v = k == null ? null : k.GetValue("SystemUsesLightTheme");
+                return !(v is int) || (int)v == 0;
+            }
+        }
+        catch { return true; }
+    }
+
+    static Color Accent()
+    {
+        try
+        {
+            using (var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\DWM"))
+            {
+                object v = k == null ? null : k.GetValue("AccentColor");
+                if (v is int) { uint c = (uint)(int)v; return Color.FromArgb((int)(c & 0xFF), (int)((c >> 8) & 0xFF), (int)((c >> 16) & 0xFF)); }   // stored as ABGR
+            }
+        }
+        catch { }
+        return Color.FromArgb(0, 120, 212);
+    }
+
+    int S(double v) { return (int)Math.Round(v * s); }
+
+    // Ask the app for the rows again, lay them out, size and place the window.
+    public void Rebuild()
+    {
+        if (IsDisposed) return;
+        items = build();
+        wasLive = Recorder.Active;
+        hover = pressed = null;
+        int pad = S(10), w = S(336), y = S(8);
+        foreach (var it in items)
+        {
+            if (it.Kind == "header" && y > S(8)) y += S(6);
+            int h;
+            switch (it.Kind)
+            {
+                case "action": h = S(40); break;
+                case "rec": h = S(46); break;
+                case "header": h = S(30); break;
+                case "radio": h = S(30); break;
+                case "note": h = S(26); break;
+                case "footer": h = S(40); break;
+                case "chips": h = LayoutChips(it, pad, y, w - 2 * pad); break;
+                default: h = S(8); break;
+            }
+            it.Rect = new Rectangle(pad, y, w - 2 * pad, h);
+            if (it.Kind == "rec" || it.Kind == "footer") LayoutRow(it);
+            y += h;
+        }
+        Place(w, y + S(8));
+        Invalidate();
+    }
+
+    // Chips flow left to right under a small label and wrap; returns the row height.
+    int LayoutChips(Item row, int x0, int y0, int width)
+    {
+        int gap = S(6), chipH = S(28), x = 0, y = string.IsNullOrEmpty(row.Text) ? 0 : S(22);
+        foreach (var c in row.Chips)
+        {
+            int cw = TextRenderer.MeasureText(c.Text, bold, Size.Empty, TextFormatFlags.NoPrefix).Width + S(22);
+            if (x > 0 && x + cw > width) { x = 0; y += chipH + gap; }
+            c.Rect = new Rectangle(x0 + x, y0 + y, cw, chipH);
+            x += cw + gap;
+        }
+        return y + chipH + S(6);
+    }
+
+    // Rec strip: time at the left, buttons from the right. Footer: first button left, the rest right.
+    void LayoutRow(Item row)
+    {
+        int chipH = S(30), gap = S(6), y = row.Rect.Y + (row.Rect.Height - chipH) / 2;
+        int right = row.Rect.Right;
+        for (int i = row.Chips.Count - 1; i >= 0; i--)
+        {
+            var c = row.Chips[i];
+            int cw = TextRenderer.MeasureText(c.Text, bold, Size.Empty, TextFormatFlags.NoPrefix).Width + S(24)
+                   + (string.IsNullOrEmpty(c.Hint) ? 0 : TextRenderer.MeasureText(c.Hint, small).Width + S(8));
+            if (row.Kind == "footer" && i == 0) { c.Rect = new Rectangle(row.Rect.X, y, cw, chipH); break; }
+            c.Rect = new Rectangle(right - cw, y, cw, chipH);
+            right -= cw + gap;
+        }
+    }
+
+    // Beside the cursor, inside the working area, on the side away from the taskbar.
+    void Place(int w, int h)
+    {
+        var cur = Cursor.Position;
+        var sc = Screen.FromPoint(cur);
+        var wa = sc.WorkingArea; var b = sc.Bounds;
+        int m = S(12), x, y;
+        if (wa.Bottom < b.Bottom) { y = wa.Bottom - m - h; x = cur.X - w / 2; }
+        else if (wa.Top > b.Top) { y = wa.Top + m; x = cur.X - w / 2; }
+        else if (wa.Left > b.Left) { x = wa.Left + m; y = cur.Y - h / 2; }
+        else { x = wa.Right - m - w; y = cur.Y - h / 2; }
+        x = Math.Max(wa.Left + m, Math.Min(x, wa.Right - m - w));
+        y = Math.Max(wa.Top + m, Math.Min(y, wa.Bottom - m - h));
+        Bounds = new Rectangle(x, y, w, h);
+        if (Region != null) Region = new Region(RecFrame.Rounded(new Rectangle(0, 0, w, h), S(8)));
+    }
+
+    Item Hit(Point p)
+    {
+        foreach (var it in items)
+        {
+            if (it.Chips != null) { foreach (var c in it.Chips) if (c.Rect.Contains(p)) return c; continue; }
+            if (it.Trail != null && it.Trail.Rect.Contains(p)) return it.Trail;
+            if ((it.Kind == "action" || it.Kind == "radio") && it.Rect.Contains(p)) return it;
+        }
+        return null;
+    }
+
+    protected override void OnMouseMove(MouseEventArgs e)
+    {
+        var h = Hit(e.Location);
+        if (h != hover) { hover = h; Invalidate(); }
+        Cursor = h != null && h.Enabled ? Cursors.Hand : Cursors.Default;
+    }
+    protected override void OnMouseLeave(EventArgs e) { if (hover != null) { hover = null; Invalidate(); } }
+    protected override void OnMouseDown(MouseEventArgs e) { pressed = Hit(e.Location); Invalidate(); }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        var h = Hit(e.Location);
+        var p = pressed; pressed = null;
+        if (h == null || h != p || !h.Enabled || h.Click == null) { Invalidate(); return; }
+        if (h.CloseFirst) { Close(); h.Click(); return; }
+        h.Click();
+        if (!IsDisposed && Visible) Rebuild();
+    }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(bg);
+        var tf = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+        foreach (var it in items)
+        {
+            var r = it.Rect;
+            switch (it.Kind)
+            {
+                case "action":
+                    Backdrop(g, r, it);
+                    TextRenderer.DrawText(g, it.Text, bold, Inset(r, S(12), 0), it.Enabled ? text : muted, tf);
+                    if (it.Trail != null) DrawTrail(g, it, r);
+                    else if (it.Hint != null) TextRenderer.DrawText(g, it.Hint, font, Inset(r, 0, S(12)), muted, tf | TextFormatFlags.Right);
+                    break;
+                case "rec":
+                    {
+                        bool paused = Recorder.Paused;
+                        var t = Recorder.Elapsed;
+                        using (var br = new SolidBrush(paused ? amber : red)) g.FillEllipse(br, r.X + S(12), r.Y + r.Height / 2 - S(5), S(10), S(10));
+                        string time = string.Format("{0}:{1:00}", (int)t.TotalMinutes, t.Seconds) + (paused ? "  paused" : "");
+                        TextRenderer.DrawText(g, time, mono, Inset(r, S(30), 0), paused ? amber : text, tf);
+                        foreach (var c in it.Chips) DrawButton(g, c, c.Text == "Stop & save");
+                        break;
+                    }
+                case "header":
+                    Rule(g, r);
+                    TextRenderer.DrawText(g, it.Text.ToUpperInvariant(), small, Inset(r, S(12), 0), muted, tf);
+                    if (it.Trail != null) DrawTrail(g, it, r);
+                    break;
+                case "radio":
+                    Backdrop(g, r, it);
+                    if (it.Checked) DrawCheck(g, new Rectangle(r.X + S(10), r.Y + (r.Height - S(14)) / 2, S(14), S(14)), it.Enabled ? accent : muted);
+                    TextRenderer.DrawText(g, it.Text, it.Checked ? bold : font, Inset(r, S(32), S(8)), it.Enabled ? text : muted, tf);
+                    break;
+                case "note":
+                    TextRenderer.DrawText(g, it.Text, font, Inset(r, S(12), 0), muted, tf);
+                    break;
+                case "chips":
+                    if (!string.IsNullOrEmpty(it.Text))
+                        TextRenderer.DrawText(g, it.Text, font, new Rectangle(r.X + S(12), r.Y, r.Width, S(22)), muted, tf);
+                    foreach (var c in it.Chips) DrawChip(g, c);
+                    break;
+                case "footer":
+                    Rule(g, r);
+                    foreach (var c in it.Chips) DrawButton(g, c, false);
+                    break;
+            }
+        }
+        using (var pen = new Pen(Color.FromArgb(dark ? 40 : 30, line)))
+        using (var p = RecFrame.Rounded(new Rectangle(0, 0, Width - 1, Height - 1), S(8))) g.DrawPath(pen, p);
+    }
+
+    static Rectangle Inset(Rectangle r, int left, int right) { return new Rectangle(r.X + left, r.Y, r.Width - left - right, r.Height); }
+
+    void Rule(Graphics g, Rectangle r)
+    {
+        using (var pen = new Pen(Color.FromArgb(dark ? 28 : 24, line))) g.DrawLine(pen, r.X, r.Y + S(2), r.Right, r.Y + S(2));
+    }
+
+    void Backdrop(Graphics g, Rectangle r, Item it)
+    {
+        if (hover != it || !it.Enabled) return;
+        using (var br = new SolidBrush(pressed == it ? chipFill : hoverFill)) using (var p = RecFrame.Rounded(r, S(5))) g.FillPath(br, p);
+    }
+
+    // A link-looking word at the right end of the row, measured so it can be hit.
+    void DrawTrail(Graphics g, Item row, Rectangle r)
+    {
+        var t = row.Trail;
+        int tw = TextRenderer.MeasureText(t.Text, font).Width + S(16);
+        t.Rect = new Rectangle(r.Right - tw, r.Y + (r.Height - S(26)) / 2, tw, S(26));
+        if (hover == t && t.Enabled) using (var br = new SolidBrush(hoverFill)) using (var p = RecFrame.Rounded(t.Rect, S(5))) g.FillPath(br, p);
+        TextRenderer.DrawText(g, t.Text, font, t.Rect, t.Enabled ? accent : muted,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+    }
+
+    void DrawChip(Graphics g, Item c)
+    {
+        var r = c.Rect;
+        Color fill = c.Checked ? (c.Enabled ? accent : muted) : hover == c && c.Enabled ? Color.FromArgb(dark ? 48 : 30, line) : chipFill;
+        using (var br = new SolidBrush(fill)) using (var p = RecFrame.Rounded(r, r.Height / 2)) g.FillPath(br, p);
+        Color tc = c.Checked ? Color.White : c.Enabled ? text : muted;
+        TextRenderer.DrawText(g, c.Text, c.Checked ? bold : font, r, tc,
+            TextFormatFlags.VerticalCenter | TextFormatFlags.HorizontalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix);
+    }
+
+    // Rec strip and footer buttons: text on a quiet backdrop; red and bold for Stop & save.
+    void DrawButton(Graphics g, Item c, bool strong)
+    {
+        var r = c.Rect;
+        bool on = hover == c && c.Enabled;
+        Color fill = strong ? (on ? Color.FromArgb(250, 76, 68) : red) : on ? hoverFill : Color.Transparent;
+        if (fill != Color.Transparent) using (var br = new SolidBrush(fill)) using (var p = RecFrame.Rounded(r, S(6))) g.FillPath(br, p);
+        Color tc = strong ? Color.White : c.Enabled ? text : muted;
+        var tf = TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
+        var f = strong ? bold : font;
+        int x = r.X + S(12);
+        TextRenderer.DrawText(g, c.Text, f, new Rectangle(x, r.Y, r.Width, r.Height), tc, tf);
+        if (!string.IsNullOrEmpty(c.Hint))
+        {
+            x += TextRenderer.MeasureText(c.Text, f, Size.Empty, TextFormatFlags.NoPrefix).Width + S(8);
+            TextRenderer.DrawText(g, c.Hint, small, new Rectangle(x, r.Y, r.Width, r.Height), strong ? Color.FromArgb(220, 255, 255, 255) : muted, tf);
+        }
+    }
+
+    static void DrawCheck(Graphics g, Rectangle r, Color c)
+    {
+        using (var pen = new Pen(c, 2f) { StartCap = LineCap.Round, EndCap = LineCap.Round, LineJoin = LineJoin.Round })
+            g.DrawLines(pen, new[] { new PointF(r.X + r.Width * 0.1f, r.Y + r.Height * 0.55f), new PointF(r.X + r.Width * 0.4f, r.Y + r.Height * 0.85f), new PointF(r.X + r.Width * 0.92f, r.Y + r.Height * 0.2f) });
+    }
+}
+
 static class Dpi
 {
     public static float Scale { get { using (var g = Graphics.FromHwnd(IntPtr.Zero)) return g.DpiX / 96f; } }
@@ -508,11 +986,13 @@ class TrayApp : ApplicationContext
     readonly KeyHook hook;
     readonly Control pump = new Control(); // marshals the hook callback onto the UI thread
     readonly Icon cameraIcon, recIcon;
-    readonly ToolStripMenuItem stopItem, pauseItem, micMenu, camMenu;
+    TrayPanel panel;
     RecFrame frame;
     CamBubble bubble;
+    PhoneBubble phone;      // the iPhone's picture, a small second bubble beside the webcam
     Countdown countdown;
     Rectangle armedArea;
+    Rectangle? drawnArea;   // the box drawn with Ctrl-drag, kept while the bar is switched to just the camera
     bool busy, restarting;
 
     public TrayApp()
@@ -522,34 +1002,17 @@ class TrayApp : ApplicationContext
         cameraIcon = MakeIcon();
         recIcon = MakeRecIcon();
         tray = new NotifyIcon { Icon = cameraIcon, Text = "Snip  -  Ctrl + ' + #", Visible = true };
-        var menu = new ContextMenuStrip();
-        menu.Items.Add("Snip now", null, (s, e) => Snip(false));
-        menu.Items.Add("Record an area", null, (s, e) => Snip(true));
-        menu.Items.Add("Record the whole screen", null, (s, e) => RecordWholeScreen());
-        menu.Items.Add("Record the camera only", null, (s, e) => ArmRecording(Rectangle.Empty, true));
-        pauseItem = new ToolStripMenuItem("Pause recording", null, (s, e) => TogglePause());
-        menu.Items.Add(pauseItem);
-        stopItem = new ToolStripMenuItem("Stop recording  (Alt+S)", null, (s, e) => StopPressed());
-        menu.Items.Add(stopItem);
-        menu.Items.Add(new ToolStripSeparator());
-        camMenu = new ToolStripMenuItem("Camera");
-        menu.Items.Add(camMenu);
-        micMenu = new ToolStripMenuItem("Microphone");
-        menu.Items.Add(micMenu);
-        menu.Items.Add("Open the recordings folder", null, (s, e) => Process.Start("explorer.exe", "\"" + Recorder.DownloadsDir() + "\""));
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("Quit", null, (s, e) => { Recorder.Stop(); CloseBubble(); tray.Visible = false; Application.Exit(); });
-        menu.Items.Add("Uninstall", null, (s, e) => Installer.Uninstall());
-        menu.Opening += (s, e) =>
+        // left click while recording stops it (the red dot); any other click opens the panel
+        tray.MouseClick += (s, e) =>
         {
-            stopItem.Visible = pauseItem.Visible = Recorder.Active;
-            pauseItem.Text = Recorder.Paused ? "Resume recording" : "Pause recording";
-            FillMics(); FillCams();
+            if (e.Button == MouseButtons.Left && Recorder.Active) StopPressed();
+            else if (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right) TogglePanel();
         };
-        tray.ContextMenuStrip = menu;
-        tray.MouseClick += (s, e) => { if (e.Button == MouseButtons.Left && Recorder.Active) StopPressed(); };
         tray.BalloonTipClicked += (s, e) => { if (Recorder.LastFile != null && File.Exists(Recorder.LastFile)) Process.Start("explorer.exe", "/select,\"" + Recorder.LastFile + "\""); };
         Recorder.Finished += OnFinished;
+        if (PhoneWanted()) PhoneCam.Start(pump);
+        PhoneCam.Shot += f => tray.ShowBalloonTip(4000, (Regex.IsMatch(f, @"\.(mov|mp4|webm)$") ? "Video" : "Picture") + " from the iPhone - paste with Ctrl+V", Path.GetFileName(f), ToolTipIcon.None);
+        PhoneCam.Changed += () => { if (panel != null && !panel.IsDisposed) panel.Rebuild(); };
         hook = new KeyHook(() => pump.BeginInvoke(new Action(() => Snip(false))),
                            () => pump.BeginInvoke(new Action(StopPressed)));
 
@@ -579,14 +1042,14 @@ class TrayApp : ApplicationContext
 
     // Show the frame with its bar; recording starts on Record, after a 3-2-1 countdown.
     // camOnly: the camera picture is put mid-screen and the frame goes round it.
-    void ArmRecording(Rectangle area, bool camOnly)
+    void ArmRecording(Rectangle area, bool camOnly, bool fromTray = true)
     {
         if (Recorder.Active || frame != null || bubble != null) return;
         if (camOnly)
         {
             if (Ffmpeg.Ensure() == null) return;
             string cam = CurrentCam();
-            if (cam == null) { MessageBox.Show("No camera found. Pick one under Camera in the tray menu.", "Snip", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
+            if (cam == null) { MessageBox.Show("No camera found. Pick one in the tray panel.", "Snip", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
             bubble = new CamBubble(cam, false);
             var wa = Screen.PrimaryScreen.WorkingArea;
             bubble.Location = new Point(wa.X + (wa.Width - bubble.Width) / 2, wa.Y + (wa.Height - bubble.Height) / 2 + 32);
@@ -594,9 +1057,21 @@ class TrayApp : ApplicationContext
             area = bubble.Bounds;
         }
         else if (CamWanted()) OpenBubble(area);
+        if (!camOnly && PhoneWanted()) OpenPhone(area);
         armedArea = area;
-        frame = new RecFrame(area, !camOnly && CurrentCam() != null, bubble != null,
-            MainPressed, TogglePause, Restart, ToggleCam, ClosePressed);
+        if (!camOnly) drawnArea = area;
+        else if (fromTray) drawnArea = null;   // the tray's "Record just the camera": no drawn area to go back to
+        bool haveCam = CurrentCam() != null;
+        frame = new RecFrame(area, !camOnly && haveCam, bubble != null, camOnly, haveCam && (!camOnly || drawnArea.HasValue),
+            !camOnly, phone != null,
+            MainPressed, TogglePause, Restart, ToggleCam, ClosePressed, ToggleSolo, TogglePhone);
+        frame.Moved += (dx, dy) =>   // the box was dragged: record the new place, and the camera goes with it
+        {
+            armedArea.Offset(dx, dy);
+            if (Recorder.Active) Recorder.MoveTo(armedArea.Location);   // mid-recording: the video follows
+            if (bubble != null) bubble.Location = new Point(bubble.Left + dx, bubble.Top + dy);
+            if (phone != null) phone.Location = new Point(phone.Left + dx, phone.Top + dy);
+        };
         frame.Show();
     }
 
@@ -604,7 +1079,8 @@ class TrayApp : ApplicationContext
     {
         if (Recorder.Active || frame != null) return;
         if (CamWanted()) OpenBubble(Screen.PrimaryScreen.WorkingArea);
-        if (!StartRecording(SystemInformation.VirtualScreen)) CloseBubble();
+        if (PhoneWanted()) OpenPhone(Screen.PrimaryScreen.WorkingArea);
+        if (!StartRecording(SystemInformation.VirtualScreen, false)) { CloseBubble(); ClosePhone(); }
     }
 
     void MainPressed()
@@ -623,7 +1099,7 @@ class TrayApp : ApplicationContext
                     {
                         t.Stop(); t.Dispose();
                         if (frame == null || frame.State != RecFrame.Mode.Counting) return;
-                        frame.State = StartRecording(armedArea) ? RecFrame.Mode.Recording : RecFrame.Mode.Ready;
+                        frame.State = StartRecording(armedArea, true) ? RecFrame.Mode.Recording : RecFrame.Mode.Ready;
                     };
                     t.Start();
                 });
@@ -662,6 +1138,16 @@ class TrayApp : ApplicationContext
         Recorder.Cancel();
     }
 
+    // The bar's "just the camera" switch, before Record: swap the drawn box for the camera picture and back.
+    void ToggleSolo()
+    {
+        if (frame == null || frame.State != RecFrame.Mode.Ready) return;
+        bool toSolo = !frame.Solo;
+        Rectangle back = drawnArea ?? armedArea;
+        CloseAll();
+        ArmRecording(back, toSolo, false);
+    }
+
     void ClosePressed()
     {
         if (frame == null) return;
@@ -683,6 +1169,15 @@ class TrayApp : ApplicationContext
         if (bubble != null) { CloseBubble(); Settings.Set("cam_on", "0"); }
         else { OpenBubble(armedArea); Settings.Set("cam_on", "1"); }
         frame.CamOn = bubble != null;
+    }
+
+    // The bar's iPhone switch: add or remove the phone's bubble, before Record or while recording.
+    void TogglePhone()
+    {
+        if (frame == null) return;
+        if (phone != null) { ClosePhone(); SetPhone(false); }
+        else { SetPhone(true); OpenPhone(armedArea); }
+        frame.PhoneOn = phone != null;
     }
 
     // Camera picture (circle, rounded square or 16:9) in the bottom-left corner of what is being recorded.
@@ -730,12 +1225,36 @@ class TrayApp : ApplicationContext
         frame.Close(); frame.Dispose(); frame = null;
     }
 
-    void CloseAll() { AbortCountdown(); CloseFrame(); CloseBubble(); }
+    void CloseAll() { AbortCountdown(); CloseFrame(); CloseBubble(); ClosePhone(); }
 
-    bool StartRecording(Rectangle area)
+    // The phone's bubble sits to the right of the webcam's, bottoms level; alone, where the webcam would be.
+    void OpenPhone(Rectangle area)
+    {
+        if (phone != null) return;
+        phone = new PhoneBubble();
+        int m = (int)(20 * Dpi.Scale);
+        if (bubble != null) phone.Location = new Point(Math.Min(bubble.Right + m / 2, area.Right - m - phone.Width), bubble.Bottom - phone.Height);
+        else phone.Location = new Point(area.X + m, Math.Max(area.Y, area.Bottom - m - phone.Height));
+        phone.Show();
+    }
+
+    void ClosePhone()
+    {
+        if (phone == null) return;
+        phone.Close(); phone.Dispose(); phone = null;
+    }
+
+    static bool PhoneWanted() { return Settings.Get("phone_on") == "1"; }
+    void SetPhone(bool on)
+    {
+        Settings.Set("phone_on", on ? "1" : "0");
+        if (on) PhoneCam.Start(pump); else PhoneCam.Stop();
+    }
+
+    bool StartRecording(Rectangle area, bool canMove)
     {
         if (Recorder.Active) return false;
-        if (!Recorder.Start(area, CurrentMic())) return false;
+        if (!Recorder.Start(area, CurrentMic(), canMove)) return false;
         tray.Icon = recIcon;
         tray.Text = "Snip  -  recording, Alt+S to stop";
         return true;
@@ -756,44 +1275,112 @@ class TrayApp : ApplicationContext
         if (file != null)
         {
             SystemSounds.Asterisk.Play();
-            tray.ShowBalloonTip(5000, "Saved to Downloads", Path.GetFileName(file), ToolTipIcon.None);
-            Process.Start("explorer.exe", "/select,\"" + file + "\"");   // open Downloads with the new file selected
+            // Put the file itself on the clipboard, as Ctrl+C in Explorer would, so Ctrl+V
+            // in WhatsApp, Slack, Teams or Gmail attaches the video.
+            bool copied = false;
+            try
+            {
+                var files = new System.Collections.Specialized.StringCollection();
+                files.Add(file);
+                Clipboard.SetFileDropList(files);
+                copied = true;
+            }
+            catch (ExternalException) { }   // clipboard held by another app; the file is still in Downloads
+            tray.ShowBalloonTip(5000, copied ? "Saved to Downloads and copied - paste with Ctrl+V" : "Saved to Downloads", Path.GetFileName(file), ToolTipIcon.None);
         }
         else if (error != null) MessageBox.Show("Recording failed.\n\n" + error, "Snip", MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 
-    void FillCams()
+    void TogglePanel()
     {
-        camMenu.DropDownItems.Clear();
-        if (Ffmpeg.Find() == null)
+        if (panel != null && !panel.IsDisposed) { panel.Close(); panel = null; return; }
+        if (busy) return;
+        panel = new TrayPanel(PanelRows);
+        panel.Show();
+    }
+
+    // Everything the tray offers, as rows of the one panel. Called again after every pick.
+    List<TrayPanel.Item> PanelRows()
+    {
+        var rows = new List<TrayPanel.Item>();
+        bool live = Recorder.Active;
+        bool idle = !live && frame == null && bubble == null;   // nothing armed or running
+        if (live)
+            rows.Add(new TrayPanel.Item { Kind = "rec", Chips = new List<TrayPanel.Item> {
+                new TrayPanel.Item { Text = Recorder.Paused ? "Resume" : "Pause", Click = TogglePause },
+                new TrayPanel.Item { Text = "Stop & save", Hint = "Alt+S", Click = StopPressed } } });
+        rows.Add(new TrayPanel.Item { Kind = "action", Text = "Snip now", Hint = "Ctrl + ' + #", CloseFirst = true, Click = () => Snip(false) });
+        rows.Add(new TrayPanel.Item { Kind = "action", Text = "Record an area", Enabled = idle, CloseFirst = true, Click = () => Snip(true),
+            Trail = new TrayPanel.Item { Text = "or the whole screen", Enabled = idle, CloseFirst = true, Click = RecordWholeScreen } });
+
+        bool haveFfmpeg = Ffmpeg.Find() != null;
+        rows.Add(new TrayPanel.Item { Kind = "header", Text = "Camera",
+            Trail = new TrayPanel.Item { Text = "Record just the camera", Enabled = idle && haveFfmpeg && CurrentCam() != null, CloseFirst = true,
+                Click = () => ArmRecording(Rectangle.Empty, true) } });
+        if (!haveFfmpeg) rows.Add(new TrayPanel.Item { Kind = "note", Text = "The camera and microphone lists appear after the first recording (FFmpeg)." });
+        else
         {
-            camMenu.DropDownItems.Add("(FFmpeg is downloaded on the first recording)").Enabled = false;
-            return;
+            string used = CurrentCam();
+            var cams = Ffmpeg.ListCams();
+            rows.Add(new TrayPanel.Item { Text = "No camera", Checked = used == null, Enabled = idle, Click = () => Settings.Set("cam", "") });
+            for (int i = 0; i < cams.Count; i++)
+            {
+                var cam = cams[i];
+                rows.Add(new TrayPanel.Item { Text = cam.Name, Checked = (cam.Alt ?? cam.Name) == used, Enabled = idle,
+                    Click = () => { Settings.Set("cam", cam.Alt ?? cam.Name); Settings.Set("cam_on", "1"); } });
+            }
+            if (cams.Count == 0) rows.Add(new TrayPanel.Item { Kind = "note", Text = "No camera found." });
+
+            // the shape of the camera on screen recordings (right-clicking the camera changes it too)
+            var shapes = new List<TrayPanel.Item>();
+            string shape = CamBubble.SavedShape();
+            for (int i = 0; i < CamBubble.Shapes.Length; i++)
+            {
+                string sh = CamBubble.Shapes[i];
+                shapes.Add(new TrayPanel.Item { Text = CamBubble.ShortShapeNames[i], Checked = sh == shape,
+                    Click = () => { if (bubble != null && bubble.Overlay) bubble.SetShape(sh); else Settings.Set("cam_shape", sh); } });
+            }
+            rows.Add(new TrayPanel.Item { Kind = "chips", Text = "Shape", Chips = shapes });
+            rows.Add(new TrayPanel.Item { Kind = "chips", Text = "Background", Chips = Bg.Cam.PanelChips() });
         }
-        string chosen = Settings.Get("cam");
-        var none = new ToolStripMenuItem("No camera") { Checked = chosen == "" };
-        none.Click += (s, e) => Settings.Set("cam", "");
-        camMenu.DropDownItems.Add(none);
-        foreach (var c in Ffmpeg.ListCams())
+
+        bool phoneOn = PhoneWanted();
+        rows.Add(new TrayPanel.Item { Kind = "header", Text = "iPhone camera",
+            Trail = new TrayPanel.Item { Text = !phoneOn ? "off" : PhoneCam.Error != null ? "not running" : PhoneCam.Connected ? "connected" : "not connected", Enabled = false } });
+        rows.Add(new TrayPanel.Item { Text = "Off", Checked = !phoneOn, Enabled = idle, Click = () => SetPhone(false) });
+        rows.Add(new TrayPanel.Item { Text = "On, as a small second bubble", Checked = phoneOn, Enabled = idle, Click = () => SetPhone(true) });
+        if (phoneOn)
         {
-            var cam = c;
-            var it = new ToolStripMenuItem(c.Name) { Checked = chosen == null ? camMenu.DropDownItems.Count == 1 : chosen == (c.Alt ?? c.Name) };
-            it.Click += (s, e) => { Settings.Set("cam", cam.Alt ?? cam.Name); Settings.Set("cam_on", "1"); };
-            camMenu.DropDownItems.Add(it);
+            rows.Add(new TrayPanel.Item { Kind = "chips", Text = "Background", Chips = Bg.Phone.PanelChips() });
+            if (PhoneCam.Error != null) rows.Add(new TrayPanel.Item { Kind = "note", Text = "Could not start: " + PhoneCam.Error });
+            else if (PhoneCam.Connected) rows.Add(new TrayPanel.Item { Kind = "note", Text = "The iPhone is sending its picture." });
+            else
+            {
+                rows.Add(new TrayPanel.Item { Kind = "note", Text = "iPhone Safari: " + PhoneCam.Address });
+                rows.Add(new TrayPanel.Item { Kind = "note", Text = "First time: " + PhoneCam.SetupAddress });
+                rows.Add(new TrayPanel.Item { Kind = "note", Text = "Only on Wi-Fi you trust." });
+            }
         }
-        if (camMenu.DropDownItems.Count == 1) camMenu.DropDownItems.Add("(no camera found)").Enabled = false;
-        // the shape of the camera on screen recordings (right-clicking the camera changes it too)
-        camMenu.DropDownItems.Add(new ToolStripSeparator());
-        string shape = CamBubble.SavedShape();
-        for (int i = 0; i < CamBubble.Shapes.Length; i++)
+
+        rows.Add(new TrayPanel.Item { Kind = "header", Text = "Microphone" });
+        if (haveFfmpeg)
         {
-            string sh = CamBubble.Shapes[i];
-            var it = new ToolStripMenuItem(CamBubble.ShapeNames[i]) { Checked = sh == shape };
-            it.Click += (s, e) => { if (bubble != null && bubble.Overlay) bubble.SetShape(sh); else Settings.Set("cam_shape", sh); };
-            camMenu.DropDownItems.Add(it);
+            var usedMic = CurrentMic();
+            var mics = Ffmpeg.ListMics();
+            rows.Add(new TrayPanel.Item { Text = "No microphone", Checked = usedMic == null, Enabled = idle, Click = () => Settings.Set("mic", "") });
+            for (int i = 0; i < mics.Count; i++)
+            {
+                var mic = mics[i];
+                rows.Add(new TrayPanel.Item { Text = mic.Name, Checked = usedMic != null && (mic.Alt ?? mic.Name) == (usedMic.Alt ?? usedMic.Name), Enabled = idle,
+                    Click = () => Settings.Set("mic", mic.Alt ?? mic.Name) });
+            }
+            if (mics.Count == 0) rows.Add(new TrayPanel.Item { Kind = "note", Text = "No microphone found." });
         }
-        camMenu.DropDownItems.Add(new ToolStripSeparator());
-        CamBg.AddMenuItems(camMenu.DropDownItems);
+
+        rows.Add(new TrayPanel.Item { Kind = "footer", Chips = new List<TrayPanel.Item> {
+            new TrayPanel.Item { Text = "Open the recordings folder", CloseFirst = true, Click = () => Process.Start("explorer.exe", "\"" + Recorder.DownloadsDir() + "\"") },
+            new TrayPanel.Item { Text = "Quit", CloseFirst = true, Click = () => { Recorder.Stop(); CloseBubble(); ClosePhone(); tray.Visible = false; Application.Exit(); } } } });
+        return rows;
     }
 
     // Saved choice, else the first camera; null = none chosen or none plugged in.
@@ -810,29 +1397,6 @@ class TrayApp : ApplicationContext
 
     // Show the camera on screen recordings unless it was switched off on the bar last time.
     static bool CamWanted() { return Settings.Get("cam_on") != "0" && CurrentCam() != null; }
-
-    // The mic list comes from ffmpeg, so it is only known once ffmpeg is.
-    void FillMics()
-    {
-        micMenu.DropDownItems.Clear();
-        if (Ffmpeg.Find() == null)
-        {
-            micMenu.DropDownItems.Add("(FFmpeg is downloaded on the first recording)").Enabled = false;
-            return;
-        }
-        string chosen = Settings.Get("mic");
-        var none = new ToolStripMenuItem("No microphone") { Checked = chosen == "" };
-        none.Click += (s, e) => Settings.Set("mic", "");
-        micMenu.DropDownItems.Add(none);
-        foreach (var m in Ffmpeg.ListMics())
-        {
-            var mic = m;
-            var it = new ToolStripMenuItem(m.Name) { Checked = chosen == null ? micMenu.DropDownItems.Count == 1 : chosen == (m.Alt ?? m.Name) };
-            it.Click += (s, e) => Settings.Set("mic", mic.Alt ?? mic.Name);
-            micMenu.DropDownItems.Add(it);
-        }
-        if (micMenu.DropDownItems.Count == 1) micMenu.DropDownItems.Add("(no microphone found)").Enabled = false;
-    }
 
     // Saved choice, else the first mic Windows lists; null means record without sound.
     static Mic CurrentMic()
@@ -897,6 +1461,8 @@ class KeyHook : IDisposable
     readonly Action fire, stop;
     readonly int vkQuote, vkHash; // resolved from the current keyboard layout
     bool fired;
+    bool hashHeld; // # is down with Ctrl, and we swallowed it
+    int hashTick;  // when, so a lost key-up can't leave it stuck
 
     // The hook lives on its own thread with its own message loop. Windows drops a
     // low-level hook whose thread is slow to answer, and the UI thread is busy for a
@@ -944,14 +1510,28 @@ class KeyHook : IDisposable
                 {
                     bool ctrl = IsDown(VK_CONTROL);
                     bool quote = vk == vkQuote || IsDown(vkQuote);
-                    bool hash = vk == vkHash || IsDown(vkHash);
+                    // A key we swallowed never shows in GetAsyncKeyState, so remember # ourselves.
+                    bool hash = vk == vkHash || IsDown(vkHash) || (hashHeld && Environment.TickCount - hashTick < 1500);
                     if (ctrl && quote && hash)
                     {
                         if (!fired) { fired = true; fire(); }
                         return (IntPtr)1; // swallow the key so it isn't typed
                     }
+                    // # first: Ctrl+# must not reach the app. It is Ctrl+\ to anything that goes by
+                    // key position, which closes the side pane in Claude desktop. AltGr reads as
+                    // Ctrl+Alt, and AltGr combos are real characters on some layouts, so leave those.
+                    if (vk == vkHash && ctrl && !IsDown(VK_MENU))
+                    {
+                        hashHeld = true;
+                        hashTick = Environment.TickCount;
+                        return (IntPtr)1;
+                    }
                 }
-                else fired = false; // chord released; allow the next one
+                else
+                {
+                    fired = false; // chord released; allow the next one
+                    if (vk == vkHash) hashHeld = false;
+                }
             }
             else if (vk == VK_S && down && Recorder.Active && IsDown(VK_MENU))
             {
@@ -975,18 +1555,22 @@ class RecFrame : Form
 {
     public enum Mode { Ready, Counting, Recording, Paused, Saving }
     const int Border = 4, Strip = 64, PillH = 52;   // Strip = pill height + gap above the box
-    const int MainId = 1, CloseId = 2, CamId = 3, PauseId = 4, RestartId = 5;
-    readonly Rectangle area;      // screen coordinates of what ffmpeg records
+    const int MainId = 1, CloseId = 2, CamId = 3, PauseId = 4, RestartId = 5, SoloId = 6, PhoneId = 7;
+    Rectangle area;               // screen coordinates of what ffmpeg records
+    public event Action<int, int> Moved;   // dx, dy: the box was dragged
+    bool dragging; Point dragFrom, dragLoc;
     readonly bool hasCam;
-    readonly Action onMain, onPause, onRestart, onCam, onClose;
+    readonly bool solo, hasSolo;  // solo: this frame records just the camera; hasSolo: the switch is on the bar
+    readonly bool hasPhone;       // the iPhone switch is on the bar (not on a camera-only frame)
+    readonly Action onMain, onPause, onRestart, onCam, onClose, onSolo, onPhone;
     readonly System.Windows.Forms.Timer tick = new System.Windows.Forms.Timer { Interval = 500 };
     readonly Font font = new Font("Segoe UI", 10.5f, FontStyle.Bold);
     readonly Font timeFont = new Font("Consolas", 12f, FontStyle.Bold);
     readonly ToolTip tip = new ToolTip { ShowAlways = true };
     Mode mode = Mode.Ready;
-    bool camOn, blink, pressed;
+    bool camOn, phoneOn, blink, pressed;
     int hover;
-    Rectangle pill, mainBtn, timeBox, camBtn, pauseBtn, restartBtn, closeBtn;
+    Rectangle pill, mainBtn, timeBox, camBtn, phoneBtn, soloBtn, pauseBtn, restartBtn, closeBtn;
     int div1, div2;
 
     static readonly Color Red = Color.FromArgb(232, 52, 46), RedHover = Color.FromArgb(250, 76, 68), RedDark = Color.FromArgb(180, 36, 32);
@@ -996,11 +1580,15 @@ class RecFrame : Form
 
     public Mode State { get { return mode; } set { mode = value; Invalidate(pill); } }
     public bool CamOn { get { return camOn; } set { camOn = value; Invalidate(pill); } }
+    public bool PhoneOn { get { return phoneOn; } set { phoneOn = value; Invalidate(pill); } }
+    public bool Solo { get { return solo; } }
 
-    public RecFrame(Rectangle area, bool hasCam, bool camOn, Action onMain, Action onPause, Action onRestart, Action onCam, Action onClose)
+    public RecFrame(Rectangle area, bool hasCam, bool camOn, bool solo, bool hasSolo, bool hasPhone, bool phoneOn,
+        Action onMain, Action onPause, Action onRestart, Action onCam, Action onClose, Action onSolo, Action onPhone)
     {
-        this.area = area; this.hasCam = hasCam; this.camOn = camOn;
-        this.onMain = onMain; this.onPause = onPause; this.onRestart = onRestart; this.onCam = onCam; this.onClose = onClose;
+        this.area = area; this.hasCam = hasCam; this.camOn = camOn; this.solo = solo; this.hasSolo = hasSolo;
+        this.hasPhone = hasPhone; this.phoneOn = phoneOn;
+        this.onMain = onMain; this.onPause = onPause; this.onRestart = onRestart; this.onCam = onCam; this.onClose = onClose; this.onSolo = onSolo; this.onPhone = onPhone;
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.Manual;
         ShowInTaskbar = false;
@@ -1008,7 +1596,7 @@ class RecFrame : Form
         BackColor = Ink;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
-        // pill: [ (o) Record ] 0:00 | cam pause restart | x   - measured, so 200 % DPI clips nothing
+        // pill: [ (o) Record ] 0:00 | cam phone solo pause restart | x   - measured, so 200 % DPI clips nothing
         int labelW = Math.Max(TextRenderer.MeasureText("Stop & save", font).Width, TextRenderer.MeasureText("Starting...", font).Width);
         int timeW = TextRenderer.MeasureText("00:00", timeFont).Width + 16;
         int b = PillH - 12;
@@ -1017,6 +1605,8 @@ class RecFrame : Form
         timeBox = new Rectangle(x, 0, timeW, PillH); x = timeBox.Right + 4;
         div1 = x; x += 9;
         if (hasCam) { camBtn = new Rectangle(x, 6, b, b); x = camBtn.Right + 2; }
+        if (hasPhone) { phoneBtn = new Rectangle(x, 6, b, b); x = phoneBtn.Right + 2; }
+        if (hasSolo) { soloBtn = new Rectangle(x, 6, b, b); x = soloBtn.Right + 2; }
         pauseBtn = new Rectangle(x, 6, b, b); x = pauseBtn.Right + 2;
         restartBtn = new Rectangle(x, 6, b, b); x = restartBtn.Right + 4;
         div2 = x; x += 9;
@@ -1025,7 +1615,7 @@ class RecFrame : Form
 
         int ringW = area.Width + 2 * Border;
         int pillX = Math.Max(0, (ringW - pillW) / 2);          // centred over the box
-        mainBtn.Offset(pillX, 0); timeBox.Offset(pillX, 0); camBtn.Offset(pillX, 0); pauseBtn.Offset(pillX, 0);
+        mainBtn.Offset(pillX, 0); timeBox.Offset(pillX, 0); camBtn.Offset(pillX, 0); phoneBtn.Offset(pillX, 0); soloBtn.Offset(pillX, 0); pauseBtn.Offset(pillX, 0);
         restartBtn.Offset(pillX, 0); closeBtn.Offset(pillX, 0); div1 += pillX; div2 += pillX;
         pill = new Rectangle(pillX, 0, pillW, PillH);
         int formW = Math.Max(ringW, pillX + pillW);
@@ -1063,6 +1653,8 @@ class RecFrame : Form
         if (mainBtn.Contains(p)) return MainId;
         if (closeBtn.Contains(p)) return CloseId;
         if (hasCam && camBtn.Contains(p)) return CamId;
+        if (hasPhone && phoneBtn.Contains(p)) return PhoneId;
+        if (hasSolo && mode == Mode.Ready && soloBtn.Contains(p)) return SoloId;
         if (Live && pauseBtn.Contains(p)) return PauseId;
         if (Live && restartBtn.Contains(p)) return RestartId;
         return 0;
@@ -1070,7 +1662,7 @@ class RecFrame : Form
 
     Rectangle RectOf(int id)
     {
-        switch (id) { case MainId: return mainBtn; case CloseId: return closeBtn; case CamId: return camBtn; case PauseId: return pauseBtn; default: return restartBtn; }
+        switch (id) { case MainId: return mainBtn; case CloseId: return closeBtn; case CamId: return camBtn; case PhoneId: return phoneBtn; case SoloId: return soloBtn; case PauseId: return pauseBtn; default: return restartBtn; }
     }
 
     string TipOf(int id)
@@ -1080,26 +1672,51 @@ class RecFrame : Form
             case MainId: return mode == Mode.Ready ? "Start recording (3, 2, 1)" : mode == Mode.Counting ? "Cancel the countdown" : "Stop and save to Downloads  (Alt+S)";
             case CloseId: return Live ? "Throw this recording away" : "Close";
             case CamId: return camOn ? "Hide the camera" : "Show the camera";
+            case PhoneId: return phoneOn ? "Remove the iPhone camera" : "Add the iPhone camera";
+            case SoloId: return solo ? "Back to the area you drew" : "Record just the camera";
             case PauseId: return mode == Mode.Paused ? "Resume" : "Pause";
             case RestartId: return "Start over";
         }
         return null;
     }
 
+    // The box can be moved before Record and while recording or paused (the video follows it):
+    // hold the bar (anywhere but its buttons) or the red edge and drag. Not during the countdown or saving.
+    bool CanDrag(Point p) { return (mode == Mode.Ready || Live) && Hit(p) == 0; }
+
+    void DragTo(Point c)
+    {
+        var vs = SystemInformation.VirtualScreen;
+        int ax = Math.Max(vs.X, Math.Min(vs.Right - area.Width, dragLoc.X + c.X - dragFrom.X + Border));
+        int ay = Math.Max(vs.Y, Math.Min(vs.Bottom - area.Height, dragLoc.Y + c.Y - dragFrom.Y + Strip));
+        int dx = ax - area.X, dy = ay - area.Y;
+        if (dx == 0 && dy == 0) return;
+        area.Offset(dx, dy);
+        Location = new Point(area.X - Border, area.Y - Strip);
+        if (Moved != null) Moved(dx, dy);
+    }
+
     protected override void OnMouseMove(MouseEventArgs e)
     {
+        if (dragging) { DragTo(Cursor.Position); return; }
         int h = Hit(e.Location);
-        Cursor = h != 0 ? Cursors.Hand : Cursors.Default;
+        Cursor = h != 0 ? Cursors.Hand : CanDrag(e.Location) ? Cursors.SizeAll : Cursors.Default;
         if (h == hover) return;
         hover = h; Invalidate(pill);
         tip.Hide(this);
         if (h != 0) tip.Show(TipOf(h), this, RectOf(h).X, -34, 2500);   // above the bar, never over the recording
     }
     protected override void OnMouseLeave(EventArgs e) { tip.Hide(this); if (hover != 0 || pressed) { hover = 0; pressed = false; Invalidate(pill); } }
-    protected override void OnMouseDown(MouseEventArgs e) { if (e.Button == MouseButtons.Left && Hit(e.Location) != 0) { pressed = true; Invalidate(pill); } }
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        if (Hit(e.Location) != 0) { pressed = true; Invalidate(pill); }
+        else if (CanDrag(e.Location)) { dragging = true; dragFrom = PointToScreen(e.Location); dragLoc = Location; tip.Hide(this); }
+    }
     protected override void OnMouseUp(MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
+        if (dragging) { DragTo(Cursor.Position); dragging = false; return; }   // the last move can arrive after the release
         bool was = pressed; pressed = false; Invalidate(pill);
         if (!was) return;
         tip.Hide(this);
@@ -1108,6 +1725,8 @@ class RecFrame : Form
             case MainId: onMain(); break;
             case CloseId: onClose(); break;
             case CamId: onCam(); break;
+            case PhoneId: onPhone(); break;
+            case SoloId: onSolo(); break;
             case PauseId: onPause(); break;
             case RestartId: onRestart(); break;
         }
@@ -1174,6 +1793,8 @@ class RecFrame : Form
         }
 
         if (hasCam) DrawCam(g, camBtn, GlyphColor(CamId, mode != Mode.Saving));
+        if (hasPhone) DrawPhone(g, phoneBtn, GlyphColor(PhoneId, mode != Mode.Saving));
+        if (hasSolo) DrawSolo(g, soloBtn, GlyphColor(SoloId, mode == Mode.Ready));
         Color pc = GlyphColor(PauseId, Live);
         Backdrop(g, pauseBtn, PauseId, Live);
         DrawPause(g, pauseBtn, pc, mode == Mode.Paused);
@@ -1204,6 +1825,37 @@ class RecFrame : Form
         {
             using (var cut = new Pen(Ink, 5)) g.DrawLine(cut, cx - 10, cy - 10, cx + 10, cy + 10);
             using (var ln = new Pen(c, 2)) g.DrawLine(ln, cx - 10, cy - 10, cx + 10, cy + 10);
+        }
+    }
+
+    // A phone outline; struck through, like the camera, while the iPhone bubble is off.
+    void DrawPhone(Graphics g, Rectangle r, Color c)
+    {
+        Backdrop(g, r, PhoneId, mode != Mode.Saving);
+        int cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
+        using (var p = new Pen(c, 2f))
+        using (var body = Rounded(new Rectangle(cx - 6, cy - 10, 12, 20), 3)) g.DrawPath(p, body);
+        using (var br = new SolidBrush(c)) g.FillEllipse(br, cx - 2, cy + 5, 4, 3);
+        if (!phoneOn)
+        {
+            using (var cut = new Pen(Ink, 5)) g.DrawLine(cut, cx - 10, cy - 10, cx + 10, cy + 10);
+            using (var ln = new Pen(c, 2)) g.DrawLine(ln, cx - 10, cy - 10, cx + 10, cy + 10);
+        }
+    }
+
+    // Head and shoulders in a frame: "just the camera". Lit red while this frame records only the camera.
+    void DrawSolo(Graphics g, Rectangle r, Color c)
+    {
+        if (solo) using (var br = new SolidBrush(mode == Mode.Ready ? Red : RedDark)) g.FillEllipse(br, r);
+        else Backdrop(g, r, SoloId, mode == Mode.Ready);
+        if (solo) c = Color.White;
+        int cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2;
+        using (var p = new Pen(c, 1.8f))
+        using (var frameBox = Rounded(new Rectangle(cx - 10, cy - 9, 20, 18), 3)) g.DrawPath(p, frameBox);
+        using (var br = new SolidBrush(c))
+        {
+            g.FillEllipse(br, cx - 3, cy - 6, 7, 7);
+            g.FillPie(br, cx - 7, cy + 2, 15, 12, 180, 180);
         }
     }
 
@@ -1262,6 +1914,7 @@ class CamBubble : Form
     public readonly bool Overlay;
     public static readonly string[] Shapes = { "circle", "square", "wide" };
     public static readonly string[] ShapeNames = { "Circle", "Rounded square", "Rounded rectangle (16:9)" };
+    public static readonly string[] ShortShapeNames = { "Circle", "Rounded square", "Wide 16:9" };
     public static string SavedShape() { string v = Settings.Get("cam_shape"); return Array.IndexOf(Shapes, v) >= 0 ? v : "circle"; }
     string shape;
     public event Action Failed;           // the camera could not be opened
@@ -1299,11 +1952,11 @@ class CamBubble : Form
                 }
                 menu.Items.Add(new ToolStripSeparator());
             }
-            CamBg.AddMenuItems(menu.Items);
+            Bg.Cam.AddMenuItems(menu.Items);
             e.Cancel = false;
         };
         ContextMenuStrip = menu;
-        if (CamBg.Mode != "none") Segmenter.Warm();
+        Bg.Cam.Warm();
     }
 
     // Change the shape in place, keeping the centre; remembered for next time.
@@ -1389,7 +2042,7 @@ class CamBubble : Form
                     Thread.CurrentThread.Priority = ThreadPriority.BelowNormal;   // the recording comes first
                     try
                     {
-                        try { CamBg.Apply(frame, w, h); } catch { }
+                        try { Bg.Cam.Apply(frame, w, h); } catch { }
                         bmp = Img.FromBytes(frame, w, h);
                         var b = bmp;
                         BeginInvoke(new Action(() => { try { if (p == proc && w == fw && h == fh) Present(b); } finally { b.Dispose(); painting = false; } }));
@@ -1481,28 +2134,56 @@ class CamBubble : Form
 
 // Background blur / picture behind the person on camera. A portrait-matting model (MODNet, Apache-2.0,
 // packed into the exe) finds the person; Windows' own ML runtime (WinML) runs it, on the GPU when it can.
-static class CamBg
+// One background effect per camera (webcam, iPhone), each with its own setting and model state.
+static class Bg
+{
+    public static readonly BgEffect Cam = new BgEffect("cam");
+    public static readonly BgEffect Phone = new BgEffect("phone");
+}
+
+class BgEffect
 {
     public static readonly string[] Modes = { "none", "blur", "picture" };
-    public static volatile string Mode = Load();
-    static Bitmap picture;                 // the chosen background picture, as loaded
-    static readonly object picLock = new object();
-    static Bitmap picScaled;               // ...and scaled to cover the last frame size
+    Bitmap picture;                 // the chosen background picture, as loaded
+    readonly object picLock = new object();
+    Bitmap picScaled;               // ...and scaled to cover the last frame size
+    public volatile string Mode;
+    readonly string prefix;                // settings prefix: "cam" or "phone"
+    readonly Segmenter seg = new Segmenter();   // each camera its own model state
 
-    static string Load()
+    public BgEffect(string prefix) { this.prefix = prefix; Mode = Load(); }
+
+    // Load the model now if an effect is on, so the first frames are not plain.
+    public void Warm() { if (Mode != "none") seg.Warm(); }
+
+    string Load()
     {
-        string m = Settings.Get("cam_bg");
-        if (m == "picture" && !LoadPicture(Settings.Get("cam_bg_pic"))) m = "none";
+        string m = Settings.Get(prefix + "_bg");
+        if (m == "picture" && !LoadPicture(Settings.Get(prefix + "_bg_pic"))) m = "none";
         return Array.IndexOf(Modes, m) >= 0 ? m : "none";
     }
 
-    static bool LoadPicture(string path)
+    // Ready-made backgrounds packed into the exe (generated with Seedream, ours to ship): setting value, menu name, chip name.
+    static readonly string[][] BuiltIn = {
+        new[] { "builtin:office", "Office with bookshelf", "Office" },
+        new[] { "builtin:meeting-room", "Bright meeting room", "Meeting room" },
+        new[] { "builtin:evening-studio", "Evening studio", "Evening studio" },
+    };
+
+    // path: a file, or "builtin:<name>" for one of the pictures above.
+    bool LoadPicture(string path)
     {
-        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return false;
+        if (string.IsNullOrEmpty(path)) return false;
+        bool builtIn = path.StartsWith("builtin:");
+        if (!builtIn && !File.Exists(path)) return false;
         try
         {
             Bitmap b;
-            using (var s = new MemoryStream(File.ReadAllBytes(path)))
+            Stream src = builtIn
+                ? System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream("bg-" + path.Substring(8) + ".jpg")
+                : new MemoryStream(File.ReadAllBytes(path));
+            if (src == null) return false;
+            using (var s = src)
             using (var img = Image.FromStream(s)) b = new Bitmap(img);
             lock (picLock) { picture = b; picScaled = null; }
             return true;
@@ -1511,49 +2192,83 @@ static class CamBg
     }
 
     // The three menu entries, for the tray's Camera menu and the camera's right-click menu.
-    public static void AddMenuItems(ToolStripItemCollection items)
+    public void AddMenuItems(ToolStripItemCollection items)
     {
-        string pic = Settings.Get("cam_bg_pic");
-        string picName = Mode == "picture" && !string.IsNullOrEmpty(pic) ? "Picture background (" + Path.GetFileName(pic) + ")..." : "Picture background...";
+        string pic = Settings.Get(prefix + "_bg_pic") ?? "";
+        bool ownPic = Mode == "picture" && pic != "" && !pic.StartsWith("builtin:");
+        string picName = ownPic ? "Your own picture (" + Path.GetFileName(pic) + ")..." : "Your own picture...";
         var none = new ToolStripMenuItem("No background effect") { Checked = Mode == "none" };
         none.Click += (s, e) => Set("none");
         var blur = new ToolStripMenuItem("Blur the background") { Checked = Mode == "blur" };
         blur.Click += (s, e) => Set("blur");
-        var picture_ = new ToolStripMenuItem(picName) { Checked = Mode == "picture" };
+        var ready = new ToolStripMenuItem("Professional background") { Checked = Mode == "picture" && pic.StartsWith("builtin:") };
+        foreach (var bi in BuiltIn)
+        {
+            string key = bi[0];
+            var it = new ToolStripMenuItem(bi[1]) { Checked = Mode == "picture" && pic == key };
+            it.Click += (s, e) => UseBuiltIn(key);
+            ready.DropDownItems.Add(it);
+        }
+        var picture_ = new ToolStripMenuItem(picName) { Checked = ownPic };
         picture_.Click += (s, e) => ChoosePicture();
-        if (Segmenter.Broken) { blur.Enabled = picture_.Enabled = false; blur.Text += "  (not available on this PC)"; }
+        if (Segmenter.Broken) { blur.Enabled = ready.Enabled = picture_.Enabled = false; blur.Text += "  (not available on this PC)"; }
         else if (!Segmenter.HaveModel) blur.Text += "  (downloads a 15 MB model first)";
-        items.Add(none); items.Add(blur); items.Add(picture_);
+        items.Add(none); items.Add(blur); items.Add(ready); items.Add(picture_);
     }
 
-    static void Set(string m)
+    // The background choices as chips for the tray panel. Ones that may prompt (model download, file dialog) close it first.
+    public List<TrayPanel.Item> PanelChips()
+    {
+        string pic = Settings.Get(prefix + "_bg_pic") ?? "";
+        bool ownPic = Mode == "picture" && pic != "" && !pic.StartsWith("builtin:");
+        bool ok = !Segmenter.Broken, prompt = !Segmenter.HaveModel;
+        var chips = new List<TrayPanel.Item>();
+        chips.Add(new TrayPanel.Item { Text = "None", Checked = Mode == "none", Click = () => Set("none") });
+        chips.Add(new TrayPanel.Item { Text = ok ? (prompt ? "Blur  (15 MB download)" : "Blur") : "Blur  (not on this PC)", Checked = Mode == "blur", Enabled = ok, CloseFirst = prompt, Click = () => Set("blur") });
+        foreach (var bi in BuiltIn)
+        {
+            string key = bi[0];
+            chips.Add(new TrayPanel.Item { Text = bi[2], Checked = Mode == "picture" && pic == key, Enabled = ok, CloseFirst = prompt, Click = () => UseBuiltIn(key) });
+        }
+        chips.Add(new TrayPanel.Item { Text = ownPic ? "Your picture: " + Path.GetFileName(pic) : "Your own picture...", Checked = ownPic, Enabled = ok, CloseFirst = true, Click = ChoosePicture });
+        return chips;
+    }
+
+    void UseBuiltIn(string key)
+    {
+        if (!LoadPicture(key)) { MessageBox.Show("Could not open that background.", "Snip", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
+        Settings.Set(prefix + "_bg_pic", key);
+        Set("picture");
+    }
+
+    void Set(string m)
     {
         if (m != "none" && !Segmenter.Ensure()) return;
-        Mode = m; Settings.Set("cam_bg", m);
-        if (m != "none") Segmenter.Warm();
+        Mode = m; Settings.Set(prefix + "_bg", m);
+        if (m != "none") seg.Warm();
     }
 
-    static void ChoosePicture()
+    void ChoosePicture()
     {
         using (var d = new OpenFileDialog { Title = "Choose a background picture", Filter = "Pictures|*.jpg;*.jpeg;*.png;*.bmp;*.gif|All files|*.*" })
         {
-            string old = Settings.Get("cam_bg_pic");
+            string old = Settings.Get(prefix + "_bg_pic");
             if (!string.IsNullOrEmpty(old) && File.Exists(old)) d.InitialDirectory = Path.GetDirectoryName(old);
             else d.InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
             if (d.ShowDialog() != DialogResult.OK) return;
             if (!LoadPicture(d.FileName)) { MessageBox.Show("Could not open that picture.", "Snip", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
-            Settings.Set("cam_bg_pic", d.FileName);
+            Settings.Set(prefix + "_bg_pic", d.FileName);
             Set("picture");
         }
     }
 
     // px: one BGRA frame, changed in place. Does nothing until the model has produced a first mask.
-    public static void Apply(byte[] px, int w, int h)
+    public void Apply(byte[] px, int w, int h)
     {
         string mode = Mode;
         if (mode == "none") return;
-        Segmenter.Offer(px, w, h);
-        var m = Segmenter.Latest;
+        seg.Offer(px, w, h);
+        var m = seg.Latest;
         if (m == null) return;
         byte[] al = Feather(m, w, h);
         byte[] bg; int bw = w, bh = h;
@@ -1744,7 +2459,7 @@ static class CamBg
     }
 
     // The picture scaled to cover the frame (cropped, never stretched).
-    static byte[] Picture(int w, int h)
+    byte[] Picture(int w, int h)
     {
         lock (picLock)
         {
@@ -1770,13 +2485,13 @@ static class CamBg
 // The model remembers the last frames (its "recurrent state"), which is what keeps the outline
 // steady from one frame to the next. It is GPL-3.0, so it is not packed into snip.exe: Snip asks
 // once and downloads it from the authors' GitHub release into its own folder.
-static class Segmenter
+class Segmenter
 {
     const string ModelUrl = "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/rvm_mobilenetv3_fp32.onnx";
     const long ModelSize = 14975696;
     static readonly string ModelPath = Path.Combine(Installer.Dir, "rvm_mobilenetv3_fp32.onnx");
-    static Windows.AI.MachineLearning.LearningModelSession session;
-    static volatile bool loading;
+    Windows.AI.MachineLearning.LearningModelSession session;
+    volatile bool loading;
     public static volatile bool Broken;
 
     public static bool HaveModel { get { try { return new FileInfo(ModelPath).Length == ModelSize; } catch { return false; } } }
@@ -1796,7 +2511,7 @@ static class Segmenter
     }
 
     // Load the model in the background; the first run on the GPU takes a few seconds, so do it now.
-    public static void Warm()
+    public void Warm()
     {
         if (session != null || loading || Broken || !HaveModel) return;
         loading = true;
@@ -1817,14 +2532,14 @@ static class Segmenter
     }
 
     // The four recurrent tensors, fed back in on the next frame; zeros to start from scratch.
-    static Windows.AI.MachineLearning.TensorFloat r1, r2, r3, r4;
-    static void Reset()
+    Windows.AI.MachineLearning.TensorFloat r1, r2, r3, r4;
+    void Reset()
     {
         r1 = Zero(); r2 = Zero(); r3 = Zero(); r4 = Zero();
     }
     static Windows.AI.MachineLearning.TensorFloat Zero() { return Windows.AI.MachineLearning.TensorFloat.CreateFromArray(new long[] { 1, 1, 1, 1 }, new float[1]); }
 
-    static float[] Run(Windows.AI.MachineLearning.LearningModelSession s, float[] src, int w, int h, float ratio)
+    float[] Run(Windows.AI.MachineLearning.LearningModelSession s, float[] src, int w, int h, float ratio)
     {
         var b = new Windows.AI.MachineLearning.LearningModelBinding(s);
         b.Bind("src", Windows.AI.MachineLearning.TensorFloat.CreateFromArray(new long[] { 1, 3, h, w }, src));
@@ -1837,13 +2552,13 @@ static class Segmenter
     }
 
     public class MaskData { public float[] A; public int W, H; }
-    public static volatile MaskData Latest;     // newest person mask (0..1), frame-sized
-    static volatile bool busy;
-    static float[] input; static int lastW, lastH;
+    public volatile MaskData Latest;     // newest person mask (0..1), frame-sized
+    volatile bool busy;
+    float[] input; int lastW, lastH;
 
     // Hand over a frame; it is only copied and worked on when the last one is finished.
-    static long lastRun;
-    public static void Offer(byte[] px, int w, int h)
+    long lastRun;
+    public void Offer(byte[] px, int w, int h)
     {
         var s = session;
         if (s == null) { Warm(); return; }
@@ -1862,7 +2577,7 @@ static class Segmenter
         });
     }
 
-    static MaskData Mask(Windows.AI.MachineLearning.LearningModelSession s, byte[] px, int w, int h)
+    MaskData Mask(Windows.AI.MachineLearning.LearningModelSession s, byte[] px, int w, int h)
     {
         int plane = w * h;
         if (w != lastW || h != lastH) { input = new float[3 * plane]; Reset(); lastW = w; lastH = h; Latest = null; }
@@ -1972,7 +2687,7 @@ class Countdown : Form
 }
 
 // Full-screen frozen, dimmed copy of the desktop. Drag a box; the box is copied bright.
-// With Shift held (or opened from "Record an area") the box becomes a recording instead.
+// With Ctrl held (or opened from "Record an area") the box becomes a recording instead.
 class Overlay : Form
 {
     readonly Bitmap shot, dimmed;
@@ -2008,7 +2723,7 @@ class Overlay : Form
         Cursor = Cursors.Cross;
     }
 
-    bool Recording { get { return recordMode || (ModifierKeys & Keys.Shift) == Keys.Shift; } }
+    bool Recording { get { return recordMode || (ModifierKeys & Keys.Control) == Keys.Control; } }
 
     string Hint
     {
@@ -2016,7 +2731,7 @@ class Overlay : Form
         {
             if (Recorder.Active) return "Recording in progress  ·  drag a box to copy it  ·  Esc cancels";
             if (Recording) return "Drag a box to record  ·  then press Record above it  ·  Esc cancels";
-            return "Drag a box to copy it  ·  hold Shift to record a video instead  ·  Esc cancels";
+            return "Drag a box to copy it  ·  hold Ctrl to record a video instead  ·  Esc cancels";
         }
     }
 
@@ -2033,16 +2748,16 @@ class Overlay : Form
         }
     }
 
-    // Shift changes the text and so the pill's width: repaint the whole strip it can occupy.
+    // Ctrl changes the text and so the pill's width: repaint the whole strip it can occupy.
     Rectangle HintBand { get { Rectangle p = Screen.PrimaryScreen.Bounds; return new Rectangle(p.Left - Left, p.Top - Top, p.Width, 100); } }
 
     protected override void OnShown(EventArgs e) { base.OnShown(e); Activate(); }
     protected override void OnKeyDown(KeyEventArgs e)
     {
         if (e.KeyCode == Keys.Escape) Close();
-        if (e.KeyCode == Keys.ShiftKey) Invalidate(HintBand);
+        if (e.KeyCode == Keys.ControlKey) Invalidate(HintBand);
     }
-    protected override void OnKeyUp(KeyEventArgs e) { if (e.KeyCode == Keys.ShiftKey) Invalidate(HintBand); }
+    protected override void OnKeyUp(KeyEventArgs e) { if (e.KeyCode == Keys.ControlKey) Invalidate(HintBand); }
 
     protected override void OnMouseDown(MouseEventArgs e) { start = e.Location; dragging = true; sel = Rectangle.Empty; }
 

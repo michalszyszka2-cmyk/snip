@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Snip">
+<link rel="apple-touch-icon" href="/icon-camera.png">
+<title>Snip camera</title>
+<style>
+html,body{margin:0;height:100%;background:#111;color:#eee;font:16px/1.4 -apple-system,system-ui,sans-serif;overflow:hidden}
+#v{position:fixed;inset:0;width:100%;height:100%;object-fit:cover;background:#000}
+#v.mirror{transform:scaleX(-1)}
+#top{position:fixed;left:0;right:0;top:0;padding:calc(env(safe-area-inset-top) + 12px) 16px 12px;display:flex;align-items:center;gap:10px;background:linear-gradient(rgba(0,0,0,.6),transparent)}
+#dot{width:12px;height:12px;border-radius:50%;background:#777;flex:none}
+#dot.on{background:#3ad15f}
+#dot.err{background:#e8342e}
+#bar{position:fixed;left:0;right:0;bottom:0;padding:16px 16px calc(env(safe-area-inset-bottom) + 16px);display:flex;flex-wrap:wrap;gap:12px;justify-content:center;background:linear-gradient(transparent,rgba(0,0,0,.6))}
+button{font:inherit;color:#fff;background:rgba(255,255,255,.18);border:0;border-radius:24px;padding:12px 20px;backdrop-filter:blur(8px)}
+button:active{background:rgba(255,255,255,.35)}
+#start{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;background:#111;text-align:center;padding:24px}
+#start button{background:#e8342e;padding:16px 32px;font-size:18px}
+#start p{max-width:320px;color:#c9c9c4;margin:0}
+#start h2{margin:0;font-size:20px;font-weight:600}
+#stop{background:rgba(232,52,46,.85)}
+.hide{display:none!important}
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<canvas id="c" class="hide"></canvas>
+<div id="top"><span id="dot"></span><span id="st">Connecting…</span></div>
+<div id="bar">
+  <button id="flip">Switch camera</button>
+  <button id="mirror">Mirror</button>
+  <button id="stop">Stop</button>
+</div>
+<div id="start">
+  <h2 id="off" class="hide">Camera off</h2>
+  <button id="go">Use this camera</button>
+  <p>The picture goes to Snip on the PC over Wi-Fi and shows as a small second bubble in the recording. Nothing is saved on the phone.</p>
+</div>
+<script>
+const v = document.getElementById('v'), c = document.getElementById('c'), ctx = c.getContext('2d');
+const dot = document.getElementById('dot'), st = document.getElementById('st');
+let facing = 'user', ws = null, stream = null, timer = null, wake = null, busy = false, running = false;
+
+function status(text, cls) { st.textContent = text; dot.className = cls || ''; }
+
+async function camera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } } });
+  v.srcObject = stream;
+  v.classList.toggle('mirror', facing === 'user');
+}
+
+function connect() {
+  ws = new WebSocket('wss://' + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => status('Sending to Snip', 'on');
+  ws.onclose = () => { if (!running) return; status('Reconnecting…'); setTimeout(() => { if (running) connect(); }, 1500); };
+  ws.onerror = () => status('No connection to the PC', 'err');
+}
+
+// About 15 frames a second, 640 px on the long side, as JPEG. Skips a frame while the last
+// one is still on its way, so a slow Wi-Fi never piles up a delay.
+function tick() {
+  if (!ws || ws.readyState !== 1 || busy || v.videoWidth === 0 || ws.bufferedAmount > 400000) return;
+  const long = 640, k = Math.min(1, long / Math.max(v.videoWidth, v.videoHeight));
+  c.width = Math.round(v.videoWidth * k) & ~1; c.height = Math.round(v.videoHeight * k) & ~1;
+  if (v.classList.contains('mirror')) { ctx.save(); ctx.translate(c.width, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(v, 0, 0, c.width, c.height);
+  if (v.classList.contains('mirror')) ctx.restore();
+  busy = true;
+  c.toBlob(b => { busy = false; if (b && ws.readyState === 1) ws.send(b); }, 'image/jpeg', 0.72);
+}
+
+async function keepAwake() {
+  try { wake = await navigator.wakeLock.request('screen'); } catch (e) { }
+}
+
+document.getElementById('go').onclick = async () => {
+  try { await camera(); } catch (e) { status('Camera refused: ' + e.message, 'err'); return; }
+  document.getElementById('start').classList.add('hide');
+  running = true;
+  connect();
+  timer = setInterval(tick, 66);
+  keepAwake();
+};
+document.getElementById('flip').onclick = async () => { facing = facing === 'user' ? 'environment' : 'user'; try { await camera(); } catch (e) { } };
+// Stop: camera off (the green dot at the top of the iPhone goes out), nothing more is sent,
+// and Snip's bubble goes back to waiting. Tap "Use this camera" to start again.
+document.getElementById('stop').onclick = () => {
+  running = false;
+  clearInterval(timer); timer = null;
+  if (ws) { try { ws.close(); } catch (e) { } ws = null; }
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  v.srcObject = null;
+  if (wake) { try { wake.release(); } catch (e) { } wake = null; }
+  status('Stopped');
+  document.getElementById('off').classList.remove('hide');
+  document.getElementById('start').classList.remove('hide');
+};
+document.getElementById('mirror').onclick = () => v.classList.toggle('mirror');
+document.addEventListener('visibilitychange', () => { if (running && document.visibilityState === 'visible') keepAwake(); });
+</script>
+</body>
+</html>
